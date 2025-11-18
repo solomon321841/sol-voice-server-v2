@@ -44,7 +44,7 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 GPT_MODEL = "gpt-4o"
 
 # =====================================================
-# ⚙️ FASTAPI APP
+#  FASTAPI APP
 # =====================================================
 app = FastAPI()
 
@@ -105,7 +105,7 @@ def memory_context(memories: list) -> str:
     return "Relevant memories:\n" + "\n".join(lines)
 
 # =====================================================
-# 🧩 NOTION PROMPT
+#  NOTION PROMPT
 # =====================================================
 async def get_notion_prompt():
     if not NOTION_PAGE_ID or not NOTION_API_KEY:
