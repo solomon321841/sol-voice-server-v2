@@ -13,7 +13,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from openai import AsyncOpenAI
-import tempfile  # for STT temp file wrapping
+import tempfile  # still imported, harmless even though we don't use it now
 
 # =====================================================
 # 🔧 LOGGING
@@ -29,6 +29,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 MEMO_API_KEY = os.getenv("MEMO_API_KEY", "").strip()
 NOTION_API_KEY = os.getenv("NOTION_API_KEY", "").strip()
 NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID", "").strip()
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()  # ✅ NEW
 
 # =====================================================
 # 🌐 n8n ENDPOINTS
@@ -221,8 +222,8 @@ async def websocket_handler(ws: WebSocket):
             input=greet
         )
         await ws.send_bytes(await tts_greet.aread())
-    except:
-        pass
+    except Exception as e:
+        log.error(f"❌ Greeting TTS error: {e}")
 
     try:
         while True:
@@ -242,24 +243,49 @@ async def websocket_handler(ws: WebSocket):
             audio_bytes = data["bytes"]
 
             # =====================================================
-            # ⭐ STT USING WHISPER-1 — FIXED FOR WEBM OPUS INPUT
+            # ⭐ STT USING DEEPGRAM (non-streaming, uses your audio chunks)
             # =====================================================
             try:
-                # Save bytes as .webm (the real format your index sends)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
-                    tmp.write(audio_bytes)
-                    tmp.flush()
-                    tmp_path = tmp.name
+                if not DEEPGRAM_API_KEY:
+                    log.error("❌ No DEEPGRAM_API_KEY set in environment.")
+                    continue
 
-                # Feed Whisper the correct MIME type
-                with open(tmp_path, "rb") as f:
-                    stt = await openai_client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=("audio.webm", f, "audio/webm"),
-                        response_format="text"
+                headers = {
+                    "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                    "Content-Type": "audio/webm",  # what your index sends
+                }
+                params = {
+                    "model": "general-nova",
+                    "smart_format": "true",
+                    "punctuate": "true",
+                }
+
+                async with httpx.AsyncClient(timeout=15) as c:
+                    r = await c.post(
+                        "https://api.deepgram.com/v1/listen",
+                        headers=headers,
+                        params=params,
+                        content=audio_bytes,
                     )
+                    if r.status_code != 200:
+                        log.error(f"❌ Deepgram STT HTTP {r.status_code}: {r.text}")
+                        continue
 
-                msg = stt.strip()
+                    dg = r.json()
+                    transcript = ""
+
+                    try:
+                        results = dg.get("results", {})
+                        channels = results.get("channels", [])
+                        if channels:
+                            alts = channels[0].get("alternatives", [])
+                            if alts:
+                                transcript = alts[0].get("transcript", "") or ""
+                    except Exception as parse_e:
+                        log.error(f"❌ Deepgram parse error: {parse_e} | payload={dg}")
+                        continue
+
+                    msg = transcript.strip()
 
                 # HARD FILTER (unchanged)
                 if (
@@ -271,7 +297,7 @@ async def websocket_handler(ws: WebSocket):
                     continue
 
             except Exception as e:
-                log.error(f"❌ STT error: {e}")
+                log.error(f"❌ STT error (Deepgram): {e}")
                 continue
 
             # =====================================================
@@ -289,6 +315,9 @@ async def websocket_handler(ws: WebSocket):
             sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
             lower = msg.lower()
 
+            # =======================
+            # Notion plate (UNCHANGED)
+            # =======================
             if any(k in lower for k in plate_kw):
                 if msg in processed_messages:
                     continue
@@ -303,10 +332,13 @@ async def websocket_handler(ws: WebSocket):
                         input=reply
                     )
                     await ws.send_bytes(await tts.aread())
-                except:
-                    pass
+                except Exception as e:
+                    log.error(f"❌ TTS plate error: {e}")
                 continue
 
+            # =========================
+            # Calendar (UNCHANGED)
+            # =========================
             if any(k in lower for k in calendar_kw):
                 reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
 
@@ -317,8 +349,8 @@ async def websocket_handler(ws: WebSocket):
                         input=reply
                     )
                     await ws.send_bytes(await tts.aread())
-                except:
-                    pass
+                except Exception as e:
+                    log.error(f"❌ TTS calendar error: {e}")
 
                 continue
 
@@ -350,20 +382,20 @@ async def websocket_handler(ws: WebSocket):
                                     input=buffer
                                 )
                                 await ws.send_bytes(await tts.aread())
-                            except:
-                                pass
+                            except Exception as e:
+                                log.error(f"❌ TTS stream-chunk error: {e}")
                             buffer = ""
 
                 if buffer.strip():
                     try:
-                        tts = await openai_client.audio.speech.create(   # <— FIXED LINE
+                        tts = await openai_client.audio.speech.create(
                             model="gpt-4o-mini-tts",
                             voice="alloy",
                             input=buffer
                         )
                         await ws.send_bytes(await tts.aread())
-                    except:
-                        pass
+                    except Exception as e:
+                        log.error(f"❌ TTS final-chunk error: {e}")
 
                 asyncio.create_task(mem0_add(user_id, msg))
 
