@@ -243,7 +243,7 @@ async def websocket_handler(ws: WebSocket):
             audio_bytes = data["bytes"]
 
             # =====================================================
-            # ⭐ STT USING DEEPGRAM (non-streaming, uses your audio chunks)
+            # ⭐ STT USING DEEPGRAM — ONLY CHANGE IS HERE
             # =====================================================
             try:
                 if not DEEPGRAM_API_KEY:
@@ -252,7 +252,7 @@ async def websocket_handler(ws: WebSocket):
 
                 headers = {
                     "Authorization": f"Token {DEEPGRAM_API_KEY}",
-                    "Content-Type": "audio/webm",  # what your index sends
+                    "Content-Type": "audio/wav",     # ✅ ONLY CHANGE
                 }
                 params = {
                     "model": "nova-2",
