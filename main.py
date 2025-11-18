@@ -255,7 +255,7 @@ async def websocket_handler(ws: WebSocket):
                     "Content-Type": "audio/webm",  # what your index sends
                 }
                 params = {
-                    "model": "general-nova",
+                    "model": "nova-2",
                     "smart_format": "true",
                     "punctuate": "true",
                 }
@@ -406,7 +406,7 @@ async def websocket_handler(ws: WebSocket):
         pass
 
 # =====================================================
-# 🚀 RUN
+#  RUN
 # =====================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
