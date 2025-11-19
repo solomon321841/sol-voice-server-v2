@@ -246,7 +246,7 @@ async def websocket_handler(ws: WebSocket):
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
 
             # =====================================================
-            # ⭐ ONE-LINE CHANGE — PCM FORMAT FOR DEEPGRAM
+            # ⭐ DEEPGRAM STT — FIXED PCM FORMAT
             # =====================================================
             try:
                 if not DEEPGRAM_API_KEY:
@@ -255,7 +255,8 @@ async def websocket_handler(ws: WebSocket):
 
                 headers = {
                     "Authorization": f"Token {DEEPGRAM_API_KEY}",
-                    "Content-Type": "application/octet-stream",  # << ONLY CHANGE
+                    # ✅ RAW 16-bit PCM @ 48kHz
+                    "Content-Type": "audio/raw;encoding=linear16;rate=48000",
                 }
                 params = {
                     "model": "nova-2",
