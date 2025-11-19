@@ -29,7 +29,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 MEMO_API_KEY = os.getenv("MEMO_API_KEY", "").strip()
 NOTION_API_KEY = os.getenv("NOTION_API_KEY", "").strip()
 NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID", "").strip()
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()  # ✅ NEW
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 
 # =====================================================
 # 🌐 n8n ENDPOINTS
@@ -48,7 +48,6 @@ GPT_MODEL = "gpt-4o"
 # =====================================================
 app = FastAPI()
 
-# CORS (correct syntax)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -71,7 +70,7 @@ async def health():
 async def mem0_search(user_id: str, query: str):
     if not MEMO_API_KEY:
         return []
-    headers = {"Authorization": f"Token {MEMO_API_KEY}"}
+    headers = {"Authorization": f"Token MEMO_API_KEY"}
     payload = {"filters": {"user_id": user_id}, "query": query}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
@@ -105,7 +104,7 @@ def memory_context(memories: list) -> str:
     return "Relevant memories:\n" + "\n".join(lines)
 
 # =====================================================
-#  NOTION PROMPT
+#  NOTION PROMPT (UNCHANGED)
 # =====================================================
 async def get_notion_prompt():
     if not NOTION_PAGE_ID or not NOTION_API_KEY:
@@ -133,7 +132,7 @@ async def get_notion_prompt():
         return "You are Solomon Roth’s AI assistant, Silas."
 
 # =====================================================
-# 🔹 /prompt ENDPOINT
+# 🔹 /prompt ENDPOINT (UNCHANGED)
 # =====================================================
 @app.get("/prompt", response_class=PlainTextResponse)
 async def get_prompt_text():
@@ -141,7 +140,7 @@ async def get_prompt_text():
     return PlainTextResponse(txt, headers={"Access-Control-Allow-Origin": "*"})
 
 # =====================================================
-# 🧩 n8n HELPERS
+# 🧩 n8n HELPERS (UNCHANGED)
 # =====================================================
 async def send_to_n8n(url: str, message: str) -> str:
     try:
@@ -214,7 +213,6 @@ async def websocket_handler(ws: WebSocket):
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
 
-    # greeting unchanged
     try:
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
@@ -243,7 +241,7 @@ async def websocket_handler(ws: WebSocket):
             audio_bytes = data["bytes"]
 
             # =====================================================
-            # ⭐ STT USING DEEPGRAM — ONLY CHANGE IS HERE
+            # ⭐ FIXED — DEEPGRAM NOW MATCHES WEBM/OPUS INPUT
             # =====================================================
             try:
                 if not DEEPGRAM_API_KEY:
@@ -252,7 +250,7 @@ async def websocket_handler(ws: WebSocket):
 
                 headers = {
                     "Authorization": f"Token {DEEPGRAM_API_KEY}",
-                    "Content-Type": "audio/wav",     # ✅ ONLY CHANGE
+                    "Content-Type": "audio/webm",   # ✅ FIXED — MATCHES BROWSER
                 }
                 params = {
                     "model": "nova-2",
@@ -287,7 +285,6 @@ async def websocket_handler(ws: WebSocket):
 
                     msg = transcript.strip()
 
-                # HARD FILTER (unchanged)
                 if (
                     not msg
                     or len(msg) < 3
@@ -315,9 +312,9 @@ async def websocket_handler(ws: WebSocket):
             sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
             lower = msg.lower()
 
-            # =======================
-            # Notion plate (UNCHANGED)
-            # =======================
+            # ============================
+            # NOTION PLATE (UNCHANGED)
+            # ============================
             if any(k in lower for k in plate_kw):
                 if msg in processed_messages:
                     continue
@@ -336,9 +333,9 @@ async def websocket_handler(ws: WebSocket):
                     log.error(f"❌ TTS plate error: {e}")
                 continue
 
-            # =========================
-            # Calendar (UNCHANGED)
-            # =========================
+            # ============================
+            # CALENDAR (UNCHANGED)
+            # ============================
             if any(k in lower for k in calendar_kw):
                 reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
 
