@@ -104,7 +104,7 @@ def memory_context(memories: list) -> str:
     return "Relevant memories:\n" + "\n".join(lines)
 
 # =====================================================
-#  NOTION PROMPT (UNCHANGED)
+#  NOTION PROMPT (UNCHANGED — DO NOT TOUCH)
 # =====================================================
 async def get_notion_prompt():
     if not NOTION_PAGE_ID or not NOTION_API_KEY:
@@ -132,7 +132,7 @@ async def get_notion_prompt():
         return "You are Solomon Roth’s AI assistant, Silas."
 
 # =====================================================
-# 🔹 /prompt ENDPOINT (UNCHANGED)
+# 🔹 /prompt ENDPOINT (UNCHANGED — DO NOT TOUCH)
 # =====================================================
 @app.get("/prompt", response_class=PlainTextResponse)
 async def get_prompt_text():
@@ -241,7 +241,12 @@ async def websocket_handler(ws: WebSocket):
             audio_bytes = data["bytes"]
 
             # =====================================================
-            # ⭐ ONE-LINE FIX — PCM FORMAT
+            # ⭐ LOGGING LINE — PCM VERIFICATION
+            # =====================================================
+            log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
+
+            # =====================================================
+            # ⭐ ONE-LINE CHANGE — PCM FORMAT FOR DEEPGRAM
             # =====================================================
             try:
                 if not DEEPGRAM_API_KEY:
@@ -313,7 +318,7 @@ async def websocket_handler(ws: WebSocket):
             lower = msg.lower()
 
             # ============================
-            # NOTION PLATE (UNCHANGED)
+            # NOTION PLATE (UNCHANGED — DO NOT TOUCH)
             # ============================
             if any(k in lower for k in plate_kw):
                 if msg in processed_messages:
@@ -329,8 +334,8 @@ async def websocket_handler(ws: WebSocket):
                         input=reply
                     )
                     await ws.send_bytes(await tts.aread())
-                except:
-                    pass
+                except Exception as e:
+                    log.error(f"❌ TTS plate error: {e}")
                 continue
 
             # ============================
@@ -346,8 +351,9 @@ async def websocket_handler(ws: WebSocket):
                         input=reply
                     )
                     await ws.send_bytes(await tts.aread())
-                except:
-                    pass
+                except Exception as e:
+                    log.error(f"❌ TTS calendar error: {e}")
+
                 continue
 
             # =====================================================
@@ -371,21 +377,27 @@ async def websocket_handler(ws: WebSocket):
                         buffer += delta
 
                         if len(buffer) > 40:
-                            tts = await openai_client.audio.speech.create(
-                                model="gpt-4o-mini-tts",
-                                voice="alloy",
-                                input=buffer
-                            )
-                            await ws.send_bytes(await tts.aread())
+                            try:
+                                tts = await openai_client.audio.speech.create(
+                                    model="gpt-4o-mini-tts",
+                                    voice="alloy",
+                                    input=buffer
+                                )
+                                await ws.send_bytes(await tts.aread())
+                            except Exception as e:
+                                log.error(f"❌ TTS stream-chunk error: {e}")
                             buffer = ""
 
                 if buffer.strip():
-                    tts = await openai_client.audio.speech.create(
-                        model="gpt-4o-mini-tts",
-                        voice="alloy",
-                        input=buffer
-                    )
-                    await ws.send_bytes(await tts.aread())
+                    try:
+                        tts = await openai_client.audio.speech.create(
+                            model="gpt-4o-mini-tts",
+                            voice="alloy",
+                            input=buffer
+                        )
+                        await ws.send_bytes(await tts.aread())
+                    except Exception as e:
+                        log.error(f"❌ TTS final-chunk error: {e}")
 
                 asyncio.create_task(mem0_add(user_id, msg))
 
