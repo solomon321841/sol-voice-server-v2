@@ -241,7 +241,7 @@ async def websocket_handler(ws: WebSocket):
             audio_bytes = data["bytes"]
 
             # =====================================================
-            # ⭐ FIXED — DEEPGRAM NOW MATCHES WEBM/OPUS INPUT
+            # ⭐ ONE-LINE FIX — PCM FORMAT
             # =====================================================
             try:
                 if not DEEPGRAM_API_KEY:
@@ -250,7 +250,7 @@ async def websocket_handler(ws: WebSocket):
 
                 headers = {
                     "Authorization": f"Token {DEEPGRAM_API_KEY}",
-                    "Content-Type": "audio/webm",   # ✅ FIXED — MATCHES BROWSER
+                    "Content-Type": "application/octet-stream",  # << ONLY CHANGE
                 }
                 params = {
                     "model": "nova-2",
@@ -329,8 +329,8 @@ async def websocket_handler(ws: WebSocket):
                         input=reply
                     )
                     await ws.send_bytes(await tts.aread())
-                except Exception as e:
-                    log.error(f"❌ TTS plate error: {e}")
+                except:
+                    pass
                 continue
 
             # ============================
@@ -346,9 +346,8 @@ async def websocket_handler(ws: WebSocket):
                         input=reply
                     )
                     await ws.send_bytes(await tts.aread())
-                except Exception as e:
-                    log.error(f"❌ TTS calendar error: {e}")
-
+                except:
+                    pass
                 continue
 
             # =====================================================
@@ -372,27 +371,21 @@ async def websocket_handler(ws: WebSocket):
                         buffer += delta
 
                         if len(buffer) > 40:
-                            try:
-                                tts = await openai_client.audio.speech.create(
-                                    model="gpt-4o-mini-tts",
-                                    voice="alloy",
-                                    input=buffer
-                                )
-                                await ws.send_bytes(await tts.aread())
-                            except Exception as e:
-                                log.error(f"❌ TTS stream-chunk error: {e}")
+                            tts = await openai_client.audio.speech.create(
+                                model="gpt-4o-mini-tts",
+                                voice="alloy",
+                                input=buffer
+                            )
+                            await ws.send_bytes(await tts.aread())
                             buffer = ""
 
                 if buffer.strip():
-                    try:
-                        tts = await openai_client.audio.speech.create(
-                            model="gpt-4o-mini-tts",
-                            voice="alloy",
-                            input=buffer
-                        )
-                        await ws.send_bytes(await tts.aread())
-                    except Exception as e:
-                        log.error(f"❌ TTS final-chunk error: {e}")
+                    tts = await openai_client.audio.speech.create(
+                        model="gpt-4o-mini-tts",
+                        voice="alloy",
+                        input=buffer
+                    )
+                    await ws.send_bytes(await tts.aread())
 
                 asyncio.create_task(mem0_add(user_id, msg))
 
