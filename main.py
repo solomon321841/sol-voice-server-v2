@@ -13,8 +13,8 @@ from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from openai import AsyncOpenAI
-import tempfile  # still imported, harmless even though we don't use it now
-import websockets  # ✅ added for Deepgram WS
+import tempfile
+import websockets
 
 # =====================================================
 # 🔧 LOGGING
@@ -66,7 +66,7 @@ async def health():
     return {"ok": True}
 
 # =====================================================
-# 🧠 MEM0 MEMORY (UNCHANGED)
+# MEM0 MEMORY (UNCHANGED)
 # =====================================================
 async def mem0_search(user_id: str, query: str):
     if not MEMO_API_KEY:
@@ -105,7 +105,7 @@ def memory_context(memories: list) -> str:
     return "Relevant memories:\n" + "\n".join(lines)
 
 # =====================================================
-#  NOTION PROMPT (UNCHANGED — DO NOT TOUCH)
+# NOTION PROMPT (UNCHANGED)
 # =====================================================
 async def get_notion_prompt():
     if not NOTION_PAGE_ID or not NOTION_API_KEY:
@@ -133,7 +133,7 @@ async def get_notion_prompt():
         return "You are Solomon Roth’s AI assistant, Silas."
 
 # =====================================================
-# 🔹 /prompt ENDPOINT (UNCHANGED — DO NOT TOUCH)
+# /prompt ENDPOINT (UNCHANGED)
 # =====================================================
 @app.get("/prompt", response_class=PlainTextResponse)
 async def get_prompt_text():
@@ -141,7 +141,7 @@ async def get_prompt_text():
     return PlainTextResponse(txt, headers={"Access-Control-Allow-Origin": "*"})
 
 # =====================================================
-# 🧩 n8n HELPERS (UNCHANGED)
+# n8n HELPERS (UNCHANGED)
 # =====================================================
 async def send_to_n8n(url: str, message: str) -> str:
     try:
@@ -214,9 +214,7 @@ async def websocket_handler(ws: WebSocket):
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
 
-    # =====================================================
     # GREETING TTS — UNCHANGED
-    # =====================================================
     try:
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
@@ -228,7 +226,7 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"❌ Greeting TTS error: {e}")
 
     # =====================================================
-    # NEW — CREATE DEEPGRAM STREAMING WS
+    # NEW — CREATE DEEPGRAM STREAMING WS (UNCHANGED)
     # =====================================================
     if not DEEPGRAM_API_KEY:
         log.error("❌ No DEEPGRAM_API_KEY set in environment.")
@@ -250,20 +248,28 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"❌ Failed to connect to Deepgram WS: {e}")
         return
 
+    # =====================================================
+    # NEW FIXED DEEPGRAM LISTENER
+    # =====================================================
     async def deepgram_listener():
-        """Reads transcripts from Deepgram and yields final ones."""
         try:
             async for message in dg_ws:
                 try:
                     data = json.loads(message)
-                    # Mode A → simple transcript JSON
-                    chan = data.get("channel", {})
-                    alts = chan.get("alternatives", [])
+
+                    # Debug log
+                    if "alternatives" in data:
+                        log.info(f"🔊 DG raw: {data}")
+
+                    # Deepgram returns alternatives at top-level
+                    alts = data.get("alternatives", [])
                     if alts:
-                        t = alts[0].get("transcript", "")
-                        if t:
-                            yield t
-                except:
+                        transcript = alts[0].get("transcript", "")
+                        if transcript:
+                            yield transcript
+
+                except Exception as e:
+                    log.error(f"❌ DG parse error: {e}")
                     continue
         except:
             pass
@@ -271,7 +277,7 @@ async def websocket_handler(ws: WebSocket):
     transcript_stream = deepgram_listener().__aiter__()
 
     # =====================================================
-    # MAIN AUDIO LOOP
+    # MAIN LOOP — UNCHANGED EXCEPT TRANSCRIPT TIMEOUT FIX
     # =====================================================
     try:
         while True:
@@ -292,27 +298,27 @@ async def websocket_handler(ws: WebSocket):
             audio_bytes = data["bytes"]
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
 
-            # =====================================================
-            # SEND PCM TO DEEPGRAM WS
-            # =====================================================
             try:
                 await dg_ws.send(audio_bytes)
             except Exception as e:
                 log.error(f"❌ Error sending audio to Deepgram WS: {e}")
                 continue
 
-            # =====================================================
-            # TRY TO READ TRANSCRIPT
-            # =====================================================
+            # FIXED TIMEOUT WINDOW
             transcript = ""
             try:
-                next_msg = await asyncio.wait_for(transcript_stream.__anext__(), timeout=0.01)
+                next_msg = await asyncio.wait_for(
+                    transcript_stream.__anext__(),
+                    timeout=0.25  # 250ms
+                )
                 transcript = next_msg.strip()
+                log.info(f"📝 DG transcript: {transcript}")
             except asyncio.TimeoutError:
                 continue
             except StopAsyncIteration:
                 continue
-            except:
+            except Exception as e:
+                log.error(f"❌ transcript read error: {e}")
                 continue
 
             if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
@@ -320,9 +326,7 @@ async def websocket_handler(ws: WebSocket):
 
             msg = transcript
 
-            # =====================================================
-            # NATURAL FLOW (UNCHANGED)
-            # =====================================================
+            # NATURAL FLOW — UNCHANGED
             norm = _normalize(msg)
             now = time.time()
             recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
@@ -335,9 +339,7 @@ async def websocket_handler(ws: WebSocket):
             sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
             lower = msg.lower()
 
-            # ============================
-            # NOTION PLATE (UNCHANGED — DO NOT TOUCH)
-            # ============================
+            # NOTION PLATE — UNCHANGED
             if any(k in lower for k in plate_kw):
                 if msg in processed_messages:
                     continue
@@ -356,9 +358,7 @@ async def websocket_handler(ws: WebSocket):
                     log.error(f"❌ TTS plate error: {e}")
                 continue
 
-            # ============================
-            # CALENDAR (UNCHANGED)
-            # ============================
+            # CALENDAR — UNCHANGED
             if any(k in lower for k in calendar_kw):
                 reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
 
@@ -374,9 +374,7 @@ async def websocket_handler(ws: WebSocket):
 
                 continue
 
-            # =====================================================
-            # NORMAL CHAT (UNCHANGED)
-            # =====================================================
+            # NORMAL CHAT — UNCHANGED
             try:
                 stream = await openai_client.chat.completions.create(
                     model=GPT_MODEL,
