@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from openai import AsyncOpenAI
 import tempfile  # still imported, harmless even though we don't use it now
+import websockets  # ✅ added for Deepgram WS
 
 # =====================================================
 # 🔧 LOGGING
@@ -213,6 +214,9 @@ async def websocket_handler(ws: WebSocket):
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
 
+    # =====================================================
+    # GREETING TTS — UNCHANGED
+    # =====================================================
     try:
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
@@ -223,6 +227,52 @@ async def websocket_handler(ws: WebSocket):
     except Exception as e:
         log.error(f"❌ Greeting TTS error: {e}")
 
+    # =====================================================
+    # NEW — CREATE DEEPGRAM STREAMING WS
+    # =====================================================
+    if not DEEPGRAM_API_KEY:
+        log.error("❌ No DEEPGRAM_API_KEY set in environment.")
+        return
+
+    dg_url = (
+        "wss://api.deepgram.com/v1/listen"
+        "?model=nova-2&encoding=linear16&sample_rate=48000"
+        "&punctuate=true&smart_format=true"
+    )
+
+    try:
+        dg_ws = await websockets.connect(
+            dg_url,
+            extra_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+            ping_interval=None
+        )
+    except Exception as e:
+        log.error(f"❌ Failed to connect to Deepgram WS: {e}")
+        return
+
+    async def deepgram_listener():
+        """Reads transcripts from Deepgram and yields final ones."""
+        try:
+            async for message in dg_ws:
+                try:
+                    data = json.loads(message)
+                    # Mode A → simple transcript JSON
+                    chan = data.get("channel", {})
+                    alts = chan.get("alternatives", [])
+                    if alts:
+                        t = alts[0].get("transcript", "")
+                        if t:
+                            yield t
+                except:
+                    continue
+        except:
+            pass
+
+    transcript_stream = deepgram_listener().__aiter__()
+
+    # =====================================================
+    # MAIN AUDIO LOOP
+    # =====================================================
     try:
         while True:
 
@@ -235,73 +285,40 @@ async def websocket_handler(ws: WebSocket):
 
             if data["type"] != "websocket.receive":
                 continue
+
             if "bytes" not in data or data["bytes"] is None:
                 continue
 
             audio_bytes = data["bytes"]
-
-            # =====================================================
-            # ⭐ LOGGING LINE — PCM VERIFICATION
-            # =====================================================
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
 
             # =====================================================
-            # ⭐ DEEPGRAM STT — FIXED PCM FORMAT
+            # SEND PCM TO DEEPGRAM WS
             # =====================================================
             try:
-                if not DEEPGRAM_API_KEY:
-                    log.error("❌ No DEEPGRAM_API_KEY set in environment.")
-                    continue
-
-                headers = {
-                    "Authorization": f"Token {DEEPGRAM_API_KEY}",
-                    # ✅ RAW 16-bit PCM @ 48kHz
-                    "Content-Type": "audio/raw;encoding=linear16;rate=48000",
-                }
-                params = {
-                    "model": "nova-2",
-                    "smart_format": "true",
-                    "punctuate": "true",
-                }
-
-                async with httpx.AsyncClient(timeout=15) as c:
-                    r = await c.post(
-                        "https://api.deepgram.com/v1/listen",
-                        headers=headers,
-                        params=params,
-                        content=audio_bytes,
-                    )
-                    if r.status_code != 200:
-                        log.error(f"❌ Deepgram STT HTTP {r.status_code}: {r.text}")
-                        continue
-
-                    dg = r.json()
-                    transcript = ""
-
-                    try:
-                        results = dg.get("results", {})
-                        channels = results.get("channels", [])
-                        if channels:
-                            alts = channels[0].get("alternatives", [])
-                            if alts:
-                                transcript = alts[0].get("transcript", "") or ""
-                    except Exception as parse_e:
-                        log.error(f"❌ Deepgram parse error: {parse_e} | payload={dg}")
-                        continue
-
-                    msg = transcript.strip()
-
-                if (
-                    not msg
-                    or len(msg) < 3
-                    or msg in [".", ",", "?", "!", "uh", "um"]
-                    or not any(ch.isalpha() for ch in msg)
-                ):
-                    continue
-
+                await dg_ws.send(audio_bytes)
             except Exception as e:
-                log.error(f"❌ STT error (Deepgram): {e}")
+                log.error(f"❌ Error sending audio to Deepgram WS: {e}")
                 continue
+
+            # =====================================================
+            # TRY TO READ TRANSCRIPT
+            # =====================================================
+            transcript = ""
+            try:
+                next_msg = await asyncio.wait_for(transcript_stream.__anext__(), timeout=0.01)
+                transcript = next_msg.strip()
+            except asyncio.TimeoutError:
+                continue
+            except StopAsyncIteration:
+                continue
+            except:
+                continue
+
+            if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
+                continue
+
+            msg = transcript
 
             # =====================================================
             # NATURAL FLOW (UNCHANGED)
@@ -407,6 +424,11 @@ async def websocket_handler(ws: WebSocket):
 
     except WebSocketDisconnect:
         pass
+    finally:
+        try:
+            await dg_ws.close()
+        except:
+            pass
 
 # =====================================================
 #  RUN
