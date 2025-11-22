@@ -243,7 +243,7 @@ async def websocket_handler(ws: WebSocket):
     try:
         dg_ws = await websockets.connect(
             dg_url,
-            extra_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+            additional_headers=[("Authorization", f"Token {DEEPGRAM_API_KEY}")],
             ping_interval=None
         )
     except Exception as e:
