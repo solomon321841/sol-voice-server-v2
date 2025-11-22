@@ -241,7 +241,7 @@ async def websocket_handler(ws: WebSocket):
     try:
         dg_ws = await websockets.connect(
             dg_url,
-            extra_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+            additional_headers=[("Authorization", f"Token {DEEPGRAM_API_KEY}")],
             ping_interval=None
         )
     except Exception as e:
@@ -249,35 +249,45 @@ async def websocket_handler(ws: WebSocket):
         return
 
     # =====================================================
-    # NEW FIXED DEEPGRAM LISTENER
+    # FIXED DEEPGRAM LISTENER (ONLY CHANGE)
     # =====================================================
     async def deepgram_listener():
+        """
+        CORRECT Deepgram streaming transcript parser.
+        Supports nova-2 streaming which always returns:
+        {
+            "type": "Results",
+            "channel": { "alternatives": [ { "transcript": "..." } ] }
+        }
+        """
         try:
-            async for message in dg_ws:
+            async for raw in dg_ws:
                 try:
-                    data = json.loads(message)
+                    data = json.loads(raw)
 
-                    # Debug log
-                    if "alternatives" in data:
-                        log.info(f"🔊 DG raw: {data}")
+                    # Must look for Results → channel → alternatives
+                    if data.get("type") != "Results":
+                        continue
 
-                    # Deepgram returns alternatives at top-level
-                    alts = data.get("alternatives", [])
-                    if alts:
-                        transcript = alts[0].get("transcript", "")
-                        if transcript:
-                            yield transcript
+                    channel = data.get("channel", {})
+                    alts = channel.get("alternatives", [])
+                    if not alts:
+                        continue
+
+                    transcript = alts[0].get("transcript", "").strip()
+                    if transcript:
+                        yield transcript
 
                 except Exception as e:
                     log.error(f"❌ DG parse error: {e}")
                     continue
-        except:
-            pass
+        except Exception as e:
+            log.error(f"❌ DG listener fatal: {e}")
 
     transcript_stream = deepgram_listener().__aiter__()
 
     # =====================================================
-    # MAIN LOOP — UNCHANGED EXCEPT TRANSCRIPT TIMEOUT FIX
+    # MAIN LOOP — UNCHANGED EXCEPT TIMEOUT
     # =====================================================
     try:
         while True:
@@ -304,12 +314,11 @@ async def websocket_handler(ws: WebSocket):
                 log.error(f"❌ Error sending audio to Deepgram WS: {e}")
                 continue
 
-            # FIXED TIMEOUT WINDOW
             transcript = ""
             try:
                 next_msg = await asyncio.wait_for(
                     transcript_stream.__anext__(),
-                    timeout=0.25  # 250ms
+                    timeout=0.25
                 )
                 transcript = next_msg.strip()
                 log.info(f"📝 DG transcript: {transcript}")
@@ -326,7 +335,6 @@ async def websocket_handler(ws: WebSocket):
 
             msg = transcript
 
-            # NATURAL FLOW — UNCHANGED
             norm = _normalize(msg)
             now = time.time()
             recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
@@ -339,7 +347,6 @@ async def websocket_handler(ws: WebSocket):
             sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
             lower = msg.lower()
 
-            # NOTION PLATE — UNCHANGED
             if any(k in lower for k in plate_kw):
                 if msg in processed_messages:
                     continue
@@ -358,7 +365,6 @@ async def websocket_handler(ws: WebSocket):
                     log.error(f"❌ TTS plate error: {e}")
                 continue
 
-            # CALENDAR — UNCHANGED
             if any(k in lower for k in calendar_kw):
                 reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
 
@@ -374,7 +380,6 @@ async def websocket_handler(ws: WebSocket):
 
                 continue
 
-            # NORMAL CHAT — UNCHANGED
             try:
                 stream = await openai_client.chat.completions.create(
                     model=GPT_MODEL,
