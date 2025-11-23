@@ -1,6 +1,3 @@
-# YOUR MAIN.PY WITH ONLY THE NOVA-2 LISTENER FIX APPLIED
-# (NO OTHER LOGIC CHANGED ANYWHERE)
-
 import os
 import json
 import logging
@@ -247,6 +244,17 @@ async def websocket_handler(ws: WebSocket):
             additional_headers=[("Authorization", f"Token {DEEPGRAM_API_KEY}")],
             ping_interval=None
         )
+
+        # =====================================================
+        # ✅ REQUIRED FIX — SEND START METADATA
+        # =====================================================
+        await dg_ws.send(json.dumps({
+            "type": "start",
+            "sample_rate": 48000,
+            "encoding": "linear16",
+            "channels": 1
+        }))
+
     except Exception as e:
         log.error(f"❌ Failed to connect to Deepgram WS: {e}")
         return
