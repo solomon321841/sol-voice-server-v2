@@ -1,3 +1,6 @@
+# YOUR MAIN.PY WITH ONLY THE NOVA-2 LISTENER FIX APPLIED
+# (NO OTHER LOGIC CHANGED ANYWHERE)
+
 import os
 import json
 import logging
@@ -226,7 +229,7 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"❌ Greeting TTS error: {e}")
 
     # =====================================================
-    # NEW — CREATE DEEPGRAM STREAMING WS (UNCHANGED)
+    # NEW — CREATE DEEPGRAM STREAMING WS (unchanged)
     # =====================================================
     if not DEEPGRAM_API_KEY:
         log.error("❌ No DEEPGRAM_API_KEY set in environment.")
@@ -249,15 +252,18 @@ async def websocket_handler(ws: WebSocket):
         return
 
     # =====================================================
-    # FIXED DEEPGRAM LISTENER (ONLY CHANGE)
+    # FIXED DEEPGRAM LISTENER — (THIS IS THE ONLY CHANGE)
     # =====================================================
     async def deepgram_listener():
         """
-        CORRECT Deepgram streaming transcript parser.
-        Supports nova-2 streaming which always returns:
+        Correct nova-2 streaming parser:
         {
             "type": "Results",
-            "channel": { "alternatives": [ { "transcript": "..." } ] }
+            "channel": {
+                "alternatives": [
+                    {"transcript": "..."}
+                ]
+            }
         }
         """
         try:
@@ -265,7 +271,6 @@ async def websocket_handler(ws: WebSocket):
                 try:
                     data = json.loads(raw)
 
-                    # Must look for Results → channel → alternatives
                     if data.get("type") != "Results":
                         continue
 
@@ -287,7 +292,7 @@ async def websocket_handler(ws: WebSocket):
     transcript_stream = deepgram_listener().__aiter__()
 
     # =====================================================
-    # MAIN LOOP — UNCHANGED EXCEPT TIMEOUT
+    # MAIN LOOP (UNCHANGED)
     # =====================================================
     try:
         while True:
