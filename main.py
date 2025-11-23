@@ -1,5 +1,3 @@
-<PASTE START>
-
 import os
 import json
 import logging
@@ -228,7 +226,7 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"❌ Greeting TTS error: {e}")
 
     # =====================================================
-    # CREATE DEEPGRAM WS
+    # NEW — CREATE DEEPGRAM STREAMING WS (unchanged)
     # =====================================================
     if not DEEPGRAM_API_KEY:
         log.error("❌ No DEEPGRAM_API_KEY set in environment.")
@@ -248,7 +246,7 @@ async def websocket_handler(ws: WebSocket):
         )
 
         # =====================================================
-        # SEND START METADATA FIRST
+        # REQUIRED FIX — SEND START METADATA
         # =====================================================
         await dg_ws.send(json.dumps({
             "type": "start",
@@ -258,7 +256,7 @@ async def websocket_handler(ws: WebSocket):
         }))
 
         # =====================================================
-        # ✅ NEW: TELL CLIENT IT MAY NOW SEND PCM
+        # ONLY CHANGE ADDED — TELL CLIENT IT MAY SEND AUDIO
         # =====================================================
         await ws.send_json({"ready_for_audio": True})
 
@@ -267,7 +265,7 @@ async def websocket_handler(ws: WebSocket):
         return
 
     # =====================================================
-    # DEEPGRAM LISTENER (UNCHANGED)
+    # FIXED DEEPGRAM LISTENER — UNCHANGED
     # =====================================================
     async def deepgram_listener():
         try:
@@ -296,7 +294,7 @@ async def websocket_handler(ws: WebSocket):
     transcript_stream = deepgram_listener().__aiter__()
 
     # =====================================================
-    # MAIN LOOP (UNCHANGED)
+    # MAIN LOOP — UNCHANGED
     # =====================================================
     try:
         while True:
@@ -448,6 +446,4 @@ async def websocket_handler(ws: WebSocket):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
-<PASTE END>
 
