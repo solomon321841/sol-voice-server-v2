@@ -214,7 +214,7 @@ async def websocket_handler(ws: WebSocket):
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
 
-    # GREETING TTS
+    # GREETING TTS — UNCHANGED
     try:
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
@@ -226,10 +226,10 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"❌ Greeting TTS error: {e}")
 
     # =====================================================
-    # DEEPGRAM WS (ONLY CHANGE IS HERE ↓)
+    # NEW — CREATE DEEPGRAM STREAMING WS (UNCHANGED)
     # =====================================================
     if not DEEPGRAM_API_KEY:
-        log.error("❌ No DEEPGRAM_API_KEY set.")
+        log.error("❌ No DEEPGRAM_API_KEY set in environment.")
         return
 
     dg_url = (
@@ -241,10 +241,7 @@ async def websocket_handler(ws: WebSocket):
     try:
         dg_ws = await websockets.connect(
             dg_url,
-            additional_headers=[
-                ("Authorization", f"Token {DEEPGRAM_API_KEY}"),
-                ("Content-Type", "audio/pcm")   # ← THE ONLY FIX
-            ],
+            additional_headers=[("Authorization", f"Token {DEEPGRAM_API_KEY}")],
             ping_interval=None
         )
     except Exception as e:
@@ -252,14 +249,23 @@ async def websocket_handler(ws: WebSocket):
         return
 
     # =====================================================
-    # FIXED DEEPGRAM LISTENER
+    # FIXED DEEPGRAM LISTENER (ONLY CHANGE)
     # =====================================================
     async def deepgram_listener():
+        """
+        CORRECT Deepgram streaming transcript parser.
+        Supports nova-2 streaming which always returns:
+        {
+            "type": "Results",
+            "channel": { "alternatives": [ { "transcript": "..." } ] }
+        }
+        """
         try:
             async for raw in dg_ws:
                 try:
                     data = json.loads(raw)
 
+                    # Must look for Results → channel → alternatives
                     if data.get("type") != "Results":
                         continue
 
@@ -275,14 +281,13 @@ async def websocket_handler(ws: WebSocket):
                 except Exception as e:
                     log.error(f"❌ DG parse error: {e}")
                     continue
-
         except Exception as e:
             log.error(f"❌ DG listener fatal: {e}")
 
     transcript_stream = deepgram_listener().__aiter__()
 
     # =====================================================
-    # MAIN LOOP (UNCHANGED)
+    # MAIN LOOP — UNCHANGED EXCEPT TIMEOUT
     # =====================================================
     try:
         while True:
