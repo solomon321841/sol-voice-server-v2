@@ -1,3 +1,5 @@
+<PASTE START>
+
 import os
 import json
 import logging
@@ -226,7 +228,7 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"❌ Greeting TTS error: {e}")
 
     # =====================================================
-    # NEW — CREATE DEEPGRAM STREAMING WS (unchanged)
+    # CREATE DEEPGRAM WS
     # =====================================================
     if not DEEPGRAM_API_KEY:
         log.error("❌ No DEEPGRAM_API_KEY set in environment.")
@@ -246,7 +248,7 @@ async def websocket_handler(ws: WebSocket):
         )
 
         # =====================================================
-        # ✅ REQUIRED FIX — SEND START METADATA
+        # SEND START METADATA FIRST
         # =====================================================
         await dg_ws.send(json.dumps({
             "type": "start",
@@ -255,25 +257,19 @@ async def websocket_handler(ws: WebSocket):
             "channels": 1
         }))
 
+        # =====================================================
+        # ✅ NEW: TELL CLIENT IT MAY NOW SEND PCM
+        # =====================================================
+        await ws.send_json({"ready_for_audio": True})
+
     except Exception as e:
         log.error(f"❌ Failed to connect to Deepgram WS: {e}")
         return
 
     # =====================================================
-    # FIXED DEEPGRAM LISTENER — (THIS IS THE ONLY CHANGE)
+    # DEEPGRAM LISTENER (UNCHANGED)
     # =====================================================
     async def deepgram_listener():
-        """
-        Correct nova-2 streaming parser:
-        {
-            "type": "Results",
-            "channel": {
-                "alternatives": [
-                    {"transcript": "..."}
-                ]
-            }
-        }
-        """
         try:
             async for raw in dg_ws:
                 try:
@@ -452,4 +448,6 @@ async def websocket_handler(ws: WebSocket):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+<PASTE END>
 
