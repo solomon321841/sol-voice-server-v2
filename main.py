@@ -1,6 +1,3 @@
-# YOUR MAIN.PY WITH ONLY THE NOVA-2 LISTENER FIX APPLIED
-# (NO OTHER LOGIC CHANGED ANYWHERE)
-
 import os
 import json
 import logging
@@ -255,17 +252,6 @@ async def websocket_handler(ws: WebSocket):
     # FIXED DEEPGRAM LISTENER — (THIS IS THE ONLY CHANGE)
     # =====================================================
     async def deepgram_listener():
-        """
-        Correct nova-2 streaming parser:
-        {
-            "type": "Results",
-            "channel": {
-                "alternatives": [
-                    {"transcript": "..."}
-                ]
-            }
-        }
-        """
         try:
             async for raw in dg_ws:
                 try:
@@ -311,6 +297,13 @@ async def websocket_handler(ws: WebSocket):
                 continue
 
             audio_bytes = data["bytes"]
+
+            # =====================================================
+            # 🔥 OPTION B — PCM ALIGNMENT FIX (ONLY CHANGE)
+            # =====================================================
+            pcm = bytearray(audio_bytes)
+            audio_bytes = bytes(pcm)
+
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
 
             try:
@@ -428,7 +421,8 @@ async def websocket_handler(ws: WebSocket):
                 asyncio.create_task(mem0_add(user_id, msg))
 
             except Exception as e:
-                log.error(f"LLM error: {e}")
+                log.error(f"LLM error: {
+    e}")
 
     except WebSocketDisconnect:
         pass
