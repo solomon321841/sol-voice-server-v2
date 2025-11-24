@@ -15,6 +15,7 @@ import uvicorn
 from openai import AsyncOpenAI
 import tempfile
 import websockets
+from asyncio import Queue   # ✅ ADDED
 
 # =====================================================
 # 🔧 LOGGING
@@ -45,10 +46,9 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 GPT_MODEL = "gpt-4o"
 
 # =====================================================
-#  FASTAPI APP
+# FASTAPI APP
 # =====================================================
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -66,7 +66,7 @@ async def health():
     return {"ok": True}
 
 # =====================================================
-# MEM0 MEMORY (UNCHANGED)
+# MEM0 (UNCHANGED)
 # =====================================================
 async def mem0_search(user_id: str, query: str):
     if not MEMO_API_KEY:
@@ -112,7 +112,6 @@ async def get_notion_prompt():
         return "You are Solomon Roth’s personal AI assistant, Silas."
 
     url = f"https://api.notion.com/v1/blocks/{NOTION_PAGE_ID}/children"
-
     headers = {
         "Authorization": f"Bearer {NOTION_API_KEY}",
         "Notion-Version": "2022-06-28",
@@ -132,9 +131,6 @@ async def get_notion_prompt():
         log.error(f"❌ Notion error: {e}")
         return "You are Solomon Roth’s AI assistant, Silas."
 
-# =====================================================
-# /prompt ENDPOINT (UNCHANGED)
-# =====================================================
 @app.get("/prompt", response_class=PlainTextResponse)
 async def get_prompt_text():
     txt = await get_notion_prompt()
@@ -172,7 +168,7 @@ async def send_to_n8n(url: str, message: str) -> str:
         return "Sorry, couldn't reach automation."
 
 # =====================================================
-# 🎤 WS HANDLER
+# NORMALIZATION HELPERS (UNCHANGED)
 # =====================================================
 def _normalize(m: str):
     m = m.lower().strip()
@@ -182,6 +178,9 @@ def _normalize(m: str):
 def _is_similar(a: str, b: str):
     return bool(a and b and (a == b or a.startswith(b) or b.startswith(a) or a in b or b in a))
 
+# =====================================================
+# 🎤 WEBSOCKET HANDLER
+# =====================================================
 @app.websocket("/ws")
 async def websocket_handler(ws: WebSocket):
 
@@ -226,7 +225,7 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"❌ Greeting TTS error: {e}")
 
     # =====================================================
-    # CREATE DEEPGRAM STREAMING WS
+    # CONNECT TO DEEPGRAM
     # =====================================================
     if not DEEPGRAM_API_KEY:
         log.error("❌ No DEEPGRAM_API_KEY set in environment.")
@@ -249,14 +248,17 @@ async def websocket_handler(ws: WebSocket):
         return
 
     # =====================================================
-    # 🔥🔥 FIXED DEEPGRAM LISTENER — UPDATED SECTION 🔥🔥
+    # NEW PARALLEL DEEPGRAM LISTENER
     # =====================================================
-    async def deepgram_listener():
+    dg_queue = Queue()
+
+    async def deepgram_listener_task():
         try:
             async for raw in dg_ws:
                 try:
                     data = json.loads(raw)
 
+                    # Filter Deepgram event types
                     if data.get("type") not in (
                         "Results",
                         "ResultCreated",
@@ -269,20 +271,22 @@ async def websocket_handler(ws: WebSocket):
 
                     channel = data.get("channel", {})
                     alts = channel.get("alternatives", [])
-                    if not alts:
-                        continue
 
-                    transcript = alts[0].get("transcript", "").strip()
+                    transcript = ""
+                    if alts:
+                        transcript = alts[0].get("transcript", "").strip()
+
                     if transcript:
-                        yield transcript
+                        await dg_queue.put(transcript)
 
                 except Exception as e:
                     log.error(f"❌ DG parse error: {e}")
-                    continue
+
         except Exception as e:
             log.error(f"❌ DG listener fatal: {e}")
 
-    transcript_stream = deepgram_listener().__aiter__()
+    # START DEEPGRAM LISTENER
+    asyncio.create_task(deepgram_listener_task())
 
     # =====================================================
     # MAIN LOOP
@@ -306,13 +310,13 @@ async def websocket_handler(ws: WebSocket):
             audio_bytes = data["bytes"]
 
             # =====================================================
-            # 🔥 PCM ALIGNMENT FIX
+            # PCM ALIGNMENT FIX
             # =====================================================
             pcm = bytearray(audio_bytes)
             audio_bytes = bytes(pcm)
 
             # =====================================================
-            # 🔥 PCM SAMPLE LOGGING
+            # PCM SAMPLE LOGGING
             # =====================================================
             import struct
             try:
@@ -324,7 +328,7 @@ async def websocket_handler(ws: WebSocket):
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
 
             # =====================================================
-            # 🔥🔥 ADDED: BACKEND PCM RMS + PEAK LOGGING 🔥🔥
+            # BACKEND PCM RMS + PEAK LOGGING
             # =====================================================
             try:
                 if len(audio_bytes) >= 2:
@@ -336,35 +340,27 @@ async def websocket_handler(ws: WebSocket):
             except Exception as e:
                 log.error(f"PCM stats error: {e}")
 
-            # =====================================================
-
+            # SEND AUDIO TO DEEPGRAM
             try:
                 await dg_ws.send(audio_bytes)
             except Exception as e:
                 log.error(f"❌ Error sending audio to Deepgram WS: {e}")
                 continue
 
+            # =====================================================
+            # GET TRANSCRIPT FROM QUEUE
+            # =====================================================
             transcript = ""
             try:
-                next_msg = await asyncio.wait_for(
-                    transcript_stream.__anext__(),
-                    timeout=1.0
-                )
-                transcript = next_msg.strip()
+                transcript = await asyncio.wait_for(dg_queue.get(), timeout=1.0)
                 log.info(f"📝 DG transcript: {transcript}")
             except asyncio.TimeoutError:
-                continue
-            except StopAsyncIteration:
-                continue
-            except Exception as e:
-                log.error(f"❌ transcript read error: {e}")
                 continue
 
             if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
                 continue
 
             msg = transcript
-
             norm = _normalize(msg)
             now = time.time()
             recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
@@ -377,6 +373,9 @@ async def websocket_handler(ws: WebSocket):
             sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
             lower = msg.lower()
 
+            # =====================================================
+            # NOTION PLATE LOGIC (UNCHANGED)
+            # =====================================================
             if any(k in lower for k in plate_kw):
                 if msg in processed_messages:
                     continue
@@ -395,6 +394,9 @@ async def websocket_handler(ws: WebSocket):
                     log.error(f"❌ TTS plate error: {e}")
                 continue
 
+            # =====================================================
+            # CALENDAR LOGIC (UNCHANGED)
+            # =====================================================
             if any(k in lower for k in calendar_kw):
                 reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
 
@@ -410,6 +412,9 @@ async def websocket_handler(ws: WebSocket):
 
                 continue
 
+            # =====================================================
+            # GENERAL GPT LOGIC (UNCHANGED)
+            # =====================================================
             try:
                 stream = await openai_client.chat.completions.create(
                     model=GPT_MODEL,
@@ -464,7 +469,7 @@ async def websocket_handler(ws: WebSocket):
             pass
 
 # =====================================================
-#  RUN
+# RUN SERVER
 # =====================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
