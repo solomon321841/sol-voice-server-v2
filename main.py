@@ -258,7 +258,14 @@ async def websocket_handler(ws: WebSocket):
                     data = json.loads(raw)
 
                     # Accept ALL meaningful transcript events
-                    if data.get("type") not in ("Results", "ResultCreated", "ResultPartial"):
+                    if data.get("type") not in (
+                        "Results",
+                        "ResultCreated",
+                        "ResultPartial",
+                        "UtteranceEnd",
+                        "UtteranceStarted",
+                        "Metadata"
+                    ):
                         continue
 
                     channel = data.get("channel", {})
@@ -327,7 +334,7 @@ async def websocket_handler(ws: WebSocket):
             try:
                 next_msg = await asyncio.wait_for(
                     transcript_stream.__anext__(),
-                    timeout=0.25
+                    timeout=1.0  # 🔥 FIXED TIMEOUT (0.25 → 1.0)
                 )
                 transcript = next_msg.strip()
                 log.info(f"📝 DG transcript: {transcript}")
