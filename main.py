@@ -9,7 +9,7 @@ from typing import List, Dict
 from dotenv import load_dotenv
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from openai import AsyncOpenAI
@@ -64,6 +64,16 @@ async def home():
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+# =====================================================
+# 🔍 DEBUG AUDIO DOWNLOAD
+# =====================================================
+@app.get("/debug-audio")
+async def download_audio():
+    path = "recordings/last.raw"
+    if not os.path.exists(path):
+        return PlainTextResponse("No audio recorded yet.", status_code=404)
+    return FileResponse(path, media_type="application/octet-stream", filename="last.raw")
 
 # =====================================================
 # MEM0 MEMORY (UNCHANGED)
@@ -187,6 +197,9 @@ async def websocket_handler(ws: WebSocket):
 
     await ws.accept()
 
+    # Ensure recordings dir exists
+    os.makedirs("recordings", exist_ok=True)
+
     user_id = "solomon_roth"
     recent_msgs = []
     processed_messages = set()
@@ -214,7 +227,7 @@ async def websocket_handler(ws: WebSocket):
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
 
-    # GREETING TTS — UNCHANGED
+    # Greeting TTS — unchanged
     try:
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
@@ -226,7 +239,7 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"❌ Greeting TTS error: {e}")
 
     # =====================================================
-    # NEW — CREATE DEEPGRAM STREAMING WS (unchanged)
+    # DEEPGRAM WS
     # =====================================================
     if not DEEPGRAM_API_KEY:
         log.error("❌ No DEEPGRAM_API_KEY set in environment.")
@@ -245,9 +258,7 @@ async def websocket_handler(ws: WebSocket):
             ping_interval=None
         )
 
-        # =====================================================
-        # REQUIRED FIX — SEND START METADATA
-        # =====================================================
+        # Start metadata
         await dg_ws.send(json.dumps({
             "type": "start",
             "sample_rate": 48000,
@@ -255,9 +266,7 @@ async def websocket_handler(ws: WebSocket):
             "channels": 1
         }))
 
-        # =====================================================
-        # ONLY CHANGE ADDED — TELL CLIENT IT MAY SEND AUDIO
-        # =====================================================
+        # Tell client to send audio
         await ws.send_json({"ready_for_audio": True})
 
     except Exception as e:
@@ -265,7 +274,7 @@ async def websocket_handler(ws: WebSocket):
         return
 
     # =====================================================
-    # FIXED DEEPGRAM LISTENER — UNCHANGED
+    # DEEPGRAM LISTENER — unchanged
     # =====================================================
     async def deepgram_listener():
         try:
@@ -286,15 +295,15 @@ async def websocket_handler(ws: WebSocket):
                         yield transcript
 
                 except Exception as e:
-                    log.error(f"❌ DG parse error: {e}")
+                    log.error(f"DG parse error: {e}")
                     continue
         except Exception as e:
-            log.error(f"❌ DG listener fatal: {e}")
+            log.error(f"DG listener fatal: {e}")
 
     transcript_stream = deepgram_listener().__aiter__()
 
     # =====================================================
-    # MAIN LOOP — UNCHANGED
+    # MAIN LOOP
     # =====================================================
     try:
         while True:
@@ -315,12 +324,27 @@ async def websocket_handler(ws: WebSocket):
             audio_bytes = data["bytes"]
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
 
+            # =====================================================
+            # 🔥 CONTINUOUS RECORDING (A1)
+            # =====================================================
+            try:
+                with open("recordings/last.raw", "ab") as f:
+                    f.write(audio_bytes)
+            except Exception as e:
+                log.error(f"❌ Recording write error: {e}")
+
+            # =====================================================
+            # SEND TO DEEPGRAM
+            # =====================================================
             try:
                 await dg_ws.send(audio_bytes)
             except Exception as e:
-                log.error(f"❌ Error sending audio to Deepgram WS: {e}")
+                log.error(f"DG send error: {e}")
                 continue
 
+            # =====================================================
+            # TRANSCRIPT
+            # =====================================================
             transcript = ""
             try:
                 next_msg = await asyncio.wait_for(
@@ -334,7 +358,7 @@ async def websocket_handler(ws: WebSocket):
             except StopAsyncIteration:
                 continue
             except Exception as e:
-                log.error(f"❌ transcript read error: {e}")
+                log.error(f"transcript read error: {e}")
                 continue
 
             if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
@@ -349,6 +373,10 @@ async def websocket_handler(ws: WebSocket):
                 continue
             recent_msgs.append((norm, now))
 
+            # =====================================================
+            # MEMORY + CONTEXT + N8N + TTS
+            # (UNCHANGED)
+            # =====================================================
             mems = await mem0_search(user_id, msg)
             ctx = memory_context(mems)
             sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
@@ -369,7 +397,7 @@ async def websocket_handler(ws: WebSocket):
                     )
                     await ws.send_bytes(await tts.aread())
                 except Exception as e:
-                    log.error(f"❌ TTS plate error: {e}")
+                    log.error(f"TTS plate error: {e}")
                 continue
 
             if any(k in lower for k in calendar_kw):
@@ -383,7 +411,7 @@ async def websocket_handler(ws: WebSocket):
                     )
                     await ws.send_bytes(await tts.aread())
                 except Exception as e:
-                    log.error(f"❌ TTS calendar error: {e}")
+                    log.error(f"TTS calendar error: {e}")
 
                 continue
 
@@ -413,7 +441,7 @@ async def websocket_handler(ws: WebSocket):
                                 )
                                 await ws.send_bytes(await tts.aread())
                             except Exception as e:
-                                log.error(f"❌ TTS stream-chunk error: {e}")
+                                log.error(f"TTS stream error: {e}")
                             buffer = ""
 
                 if buffer.strip():
@@ -425,7 +453,7 @@ async def websocket_handler(ws: WebSocket):
                         )
                         await ws.send_bytes(await tts.aread())
                     except Exception as e:
-                        log.error(f"❌ TTS final-chunk error: {e}")
+                        log.error(f"TTS final error: {e}")
 
                 asyncio.create_task(mem0_add(user_id, msg))
 
