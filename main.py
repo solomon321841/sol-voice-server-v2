@@ -325,6 +325,11 @@ async def websocket_handler(ws: WebSocket):
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
 
             # =====================================================
+            # 🔥 PCM ALIGNMENT FIX (ONLY CHANGE)
+            # =====================================================
+            audio_bytes = bytes(audio_bytes)   # 🔥 FORCE CORRECT 16-BIT PCM FORMAT
+
+            # =====================================================
             # 🔥 CONTINUOUS RECORDING (A1)
             # =====================================================
             try:
