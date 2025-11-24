@@ -15,7 +15,7 @@ import uvicorn
 from openai import AsyncOpenAI
 import tempfile
 import websockets
-from asyncio import Queue   #
+from asyncio import Queue
 
 # =====================================================
 # 🔧 LOGGING
@@ -231,10 +231,16 @@ async def websocket_handler(ws: WebSocket):
         log.error("❌ No DEEPGRAM_API_KEY set in environment.")
         return
 
+    # ✅ FINAL CORRECT PCM + NOVA-2 URL (Option B)
     dg_url = (
         "wss://api.deepgram.com/v1/listen"
-        "?model=nova-2&encoding=linear16&sample_rate=48000&raw=true"
-        "&punctuate=true&smart_format=true"
+        "?model=nova-2"
+        "&encoding=linear16"
+        "&sample_rate=48000"
+        "&channels=1"
+        "&language=en"
+        "&tier=base"
+        "&raw=true"
     )
 
     try:
@@ -258,7 +264,6 @@ async def websocket_handler(ws: WebSocket):
                 try:
                     data = json.loads(raw)
 
-                    # Filter Deepgram event types
                     if data.get("type") not in (
                         "Results",
                         "ResultCreated",
@@ -285,7 +290,6 @@ async def websocket_handler(ws: WebSocket):
         except Exception as e:
             log.error(f"❌ DG listener fatal: {e}")
 
-    # START DEEPGRAM LISTENER
     asyncio.create_task(deepgram_listener_task())
 
     # =====================================================
@@ -309,15 +313,9 @@ async def websocket_handler(ws: WebSocket):
 
             audio_bytes = data["bytes"]
 
-            # =====================================================
-            # PCM ALIGNMENT FIX
-            # =====================================================
             pcm = bytearray(audio_bytes)
             audio_bytes = bytes(pcm)
 
-            # =====================================================
-            # PCM SAMPLE LOGGING
-            # =====================================================
             import struct
             try:
                 samples = struct.unpack("<10h", audio_bytes[:20])
@@ -327,9 +325,6 @@ async def websocket_handler(ws: WebSocket):
 
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
 
-            # =====================================================
-            # BACKEND PCM RMS + PEAK LOGGING
-            # =====================================================
             try:
                 if len(audio_bytes) >= 2:
                     total_samples = len(audio_bytes) // 2
@@ -340,16 +335,12 @@ async def websocket_handler(ws: WebSocket):
             except Exception as e:
                 log.error(f"PCM stats error: {e}")
 
-            # SEND AUDIO TO DEEPGRAM
             try:
                 await dg_ws.send(audio_bytes)
             except Exception as e:
                 log.error(f"❌ Error sending audio to Deepgram WS: {e}")
                 continue
 
-            # =====================================================
-            # GET TRANSCRIPT FROM QUEUE
-            # =====================================================
             transcript = ""
             try:
                 transcript = await asyncio.wait_for(dg_queue.get(), timeout=1.0)
@@ -373,9 +364,6 @@ async def websocket_handler(ws: WebSocket):
             sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
             lower = msg.lower()
 
-            # =====================================================
-            # NOTION PLATE LOGIC (UNCHANGED)
-            # =====================================================
             if any(k in lower for k in plate_kw):
                 if msg in processed_messages:
                     continue
@@ -387,24 +375,21 @@ async def websocket_handler(ws: WebSocket):
                     tts = await openai_client.audio.speech.create(
                         model="gpt-4o-mini-tts",
                         voice="alloy",
-                        input=reply
+                        input=    reply
                     )
                     await ws.send_bytes(await tts.aread())
                 except Exception as e:
                     log.error(f"❌ TTS plate error: {e}")
                 continue
 
-            # =====================================================
-            # CALENDAR LOGIC (UNCHANGED)
-            # =====================================================
             if any(k in lower for k in calendar_kw):
-                reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
+                reply = await sendTo_n8n(N8N_CALENDAR_URL, msg)
 
                 try:
                     tts = await openai_client.audio.speech.create(
                         model="gpt-4o-mini-tts",
                         voice="alloy",
-                        input=reply
+                        input=    reply
                     )
                     await ws.send_bytes(await tts.aread())
                 except Exception as e:
@@ -412,9 +397,6 @@ async def websocket_handler(ws: WebSocket):
 
                 continue
 
-            # =====================================================
-            # GENERAL GPT LOGIC (UNCHANGED)
-            # =====================================================
             try:
                 stream = await openai_client.chat.completions.create(
                     model=GPT_MODEL,
@@ -437,7 +419,7 @@ async def websocket_handler(ws: WebSocket):
                                 tts = await openai_client.audio.speech.create(
                                     model="gpt-4o-mini-tts",
                                     voice="alloy",
-                                    input=buffer
+                                    input=    buffer
                                 )
                                 await ws.send_bytes(await tts.aread())
                             except Exception as e:
