@@ -274,11 +274,12 @@ async def websocket_handler(ws: WebSocket):
         return
 
     # =====================================================
-    # DEEPGRAM LISTENER — unchanged
+    # DEEPGRAM LISTENER — unchanged except debug line
     # =====================================================
     async def deepgram_listener():
         try:
             async for raw in dg_ws:
+                log.info(f"DG RAW EVENT: {raw[:100]}")  # 🔥 DEBUG LINE ADDED
                 try:
                     data = json.loads(raw)
 
@@ -324,13 +325,11 @@ async def websocket_handler(ws: WebSocket):
             audio_bytes = data["bytes"]
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
 
-            # =====================================================
-            # 🔥 PCM ALIGNMENT FIX (ONLY CHANGE)
-            # =====================================================
-            audio_bytes = bytes(audio_bytes)   # 🔥 FORCE CORRECT 16-BIT PCM FORMAT
+            # PCM FIX — unchanged
+            audio_bytes = bytes(audio_bytes)
 
             # =====================================================
-            # 🔥 CONTINUOUS RECORDING (A1)
+            # CONTINUOUS RECORDING
             # =====================================================
             try:
                 with open("recordings/last.raw", "ab") as f:
@@ -343,6 +342,7 @@ async def websocket_handler(ws: WebSocket):
             # =====================================================
             try:
                 await dg_ws.send(audio_bytes)
+                log.info(f"SENT TO DG: {len(audio_bytes)} bytes")  # 🔥 DEBUG LINE ADDED
             except Exception as e:
                 log.error(f"DG send error: {e}")
                 continue
@@ -380,7 +380,6 @@ async def websocket_handler(ws: WebSocket):
 
             # =====================================================
             # MEMORY + CONTEXT + N8N + TTS
-            # (UNCHANGED)
             # =====================================================
             mems = await mem0_search(user_id, msg)
             ctx = memory_context(mems)
