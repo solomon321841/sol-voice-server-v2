@@ -257,7 +257,6 @@ async def websocket_handler(ws: WebSocket):
                 try:
                     data = json.loads(raw)
 
-                    # Accept ALL meaningful transcript events
                     if data.get("type") not in (
                         "Results",
                         "ResultCreated",
@@ -324,6 +323,21 @@ async def websocket_handler(ws: WebSocket):
 
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
 
+            # =====================================================
+            # 🔥🔥 ADDED: BACKEND PCM RMS + PEAK LOGGING 🔥🔥
+            # =====================================================
+            try:
+                if len(audio_bytes) >= 2:
+                    total_samples = len(audio_bytes) // 2
+                    all_samples = struct.unpack("<" + "h" * total_samples, audio_bytes[: total_samples * 2])
+                    peak = max(abs(s) for s in all_samples)
+                    rms = (sum(s * s for s in all_samples) / total_samples) ** 0.5
+                    log.info(f"🔊 PCM STATS — RMS={rms:.2f}, Peak={peak}")
+            except Exception as e:
+                log.error(f"PCM stats error: {e}")
+
+            # =====================================================
+
             try:
                 await dg_ws.send(audio_bytes)
             except Exception as e:
@@ -334,7 +348,7 @@ async def websocket_handler(ws: WebSocket):
             try:
                 next_msg = await asyncio.wait_for(
                     transcript_stream.__anext__(),
-                    timeout=1.0  # 🔥 FIXED TIMEOUT (0.25 → 1.0)
+                    timeout=1.0
                 )
                 transcript = next_msg.strip()
                 log.info(f"📝 DG transcript: {transcript}")
