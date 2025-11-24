@@ -226,7 +226,7 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"❌ Greeting TTS error: {e}")
 
     # =====================================================
-    # CREATE DEEPGRAM STREAMING WS — NOW USING OPUS
+    # CREATE DEEPGRAM STREAMING WS
     # =====================================================
     if not DEEPGRAM_API_KEY:
         log.error("❌ No DEEPGRAM_API_KEY set in environment.")
@@ -234,7 +234,7 @@ async def websocket_handler(ws: WebSocket):
 
     dg_url = (
         "wss://api.deepgram.com/v1/listen"
-        "?model=nova-2&encoding=opus&sample_rate=48000"
+        "?model=nova-2&encoding=linear16&sample_rate=48000"
         "&punctuate=true&smart_format=true"
     )
 
@@ -249,7 +249,7 @@ async def websocket_handler(ws: WebSocket):
         return
 
     # =====================================================
-    # STREAM OPUS DIRECTLY — NO DECODING / PCM LOGGING
+    # 🔥🔥 FIXED DEEPGRAM LISTENER — UPDATED SECTION 🔥🔥
     # =====================================================
     async def deepgram_listener():
         try:
@@ -306,19 +306,44 @@ async def websocket_handler(ws: WebSocket):
             audio_bytes = data["bytes"]
 
             # =====================================================
-            # 🔥 OPUS MODE — FORWARD DIRECTLY TO DEEPGRAM
+            # 🔥 PCM ALIGNMENT FIX
             # =====================================================
-            log.info(f"🎧 OPUS audio received — {len(audio_bytes)} bytes")
+            pcm = bytearray(audio_bytes)
+            audio_bytes = bytes(pcm)
+
+            # =====================================================
+            # 🔥 PCM SAMPLE LOGGING
+            # =====================================================
+            import struct
+            try:
+                samples = struct.unpack("<10h", audio_bytes[:20])
+                log.info(f"PCM samples[0:10] = {list(samples)}")
+            except Exception as e:
+                log.error(f"sample unpack error: {e}")
+
+            log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
+
+            # =====================================================
+            # 🔥🔥 ADDED: BACKEND PCM RMS + PEAK LOGGING 🔥🔥
+            # =====================================================
+            try:
+                if len(audio_bytes) >= 2:
+                    total_samples = len(audio_bytes) // 2
+                    all_samples = struct.unpack("<" + "h" * total_samples, audio_bytes[: total_samples * 2])
+                    peak = max(abs(s) for s in all_samples)
+                    rms = (sum(s * s for s in all_samples) / total_samples) ** 0.5
+                    log.info(f"🔊 PCM STATS — RMS={rms:.2f}, Peak={peak}")
+            except Exception as e:
+                log.error(f"PCM stats error: {e}")
+
+            # =====================================================
 
             try:
                 await dg_ws.send(audio_bytes)
             except Exception as e:
-                log.error(f"❌ Error sending OPUS to Deepgram WS: {e}")
+                log.error(f"❌ Error sending audio to Deepgram WS: {e}")
                 continue
 
-            # =====================================================
-            # TRANSCRIPT READ
-            # =====================================================
             transcript = ""
             try:
                 next_msg = await asyncio.wait_for(
