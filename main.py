@@ -249,7 +249,7 @@ async def websocket_handler(ws: WebSocket):
         return
 
     # =====================================================
-    # FIXED DEEPGRAM LISTENER — (THIS IS THE ONLY CHANGE)
+    # FIXED DEEPGRAM LISTENER — UNCHANGED
     # =====================================================
     async def deepgram_listener():
         try:
@@ -278,7 +278,7 @@ async def websocket_handler(ws: WebSocket):
     transcript_stream = deepgram_listener().__aiter__()
 
     # =====================================================
-    # MAIN LOOP (UNCHANGED)
+    # MAIN LOOP (UNCHANGED EXCEPT SAMPLE LOG)
     # =====================================================
     try:
         while True:
@@ -299,10 +299,20 @@ async def websocket_handler(ws: WebSocket):
             audio_bytes = data["bytes"]
 
             # =====================================================
-            # 🔥 OPTION B — PCM ALIGNMENT FIX (ONLY CHANGE)
+            # 🔥 OPTION B — PCM ALIGNMENT FIX (ONLY CHANGE PART 1)
             # =====================================================
             pcm = bytearray(audio_bytes)
             audio_bytes = bytes(pcm)
+
+            # =====================================================
+            # 🔥 PCM SAMPLE LOGGING (ONLY CHANGE PART 2)
+            # =====================================================
+            import struct
+            try:
+                samples = struct.unpack("<10h", audio_bytes[:20])
+                log.info(f"PCM samples[0:10] = {list(samples)}")
+            except Exception as e:
+                log.error(f"sample unpack error: {e}")
 
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
 
@@ -421,8 +431,7 @@ async def websocket_handler(ws: WebSocket):
                 asyncio.create_task(mem0_add(user_id, msg))
 
             except Exception as e:
-                log.error(f"LLM error: {
-    e}")
+                log.error(f"LLM error: {e}")
 
     except WebSocketDisconnect:
         pass
