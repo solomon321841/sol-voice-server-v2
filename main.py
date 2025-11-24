@@ -226,7 +226,7 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"❌ Greeting TTS error: {e}")
 
     # =====================================================
-    # NEW — CREATE DEEPGRAM STREAMING WS (unchanged)
+    # CREATE DEEPGRAM STREAMING WS
     # =====================================================
     if not DEEPGRAM_API_KEY:
         log.error("❌ No DEEPGRAM_API_KEY set in environment.")
@@ -249,7 +249,7 @@ async def websocket_handler(ws: WebSocket):
         return
 
     # =====================================================
-    # FIXED DEEPGRAM LISTENER — UNCHANGED
+    # 🔥🔥 FIXED DEEPGRAM LISTENER — UPDATED SECTION 🔥🔥
     # =====================================================
     async def deepgram_listener():
         try:
@@ -257,7 +257,8 @@ async def websocket_handler(ws: WebSocket):
                 try:
                     data = json.loads(raw)
 
-                    if data.get("type") != "Results":
+                    # Accept ALL meaningful transcript events
+                    if data.get("type") not in ("Results", "ResultCreated", "ResultPartial"):
                         continue
 
                     channel = data.get("channel", {})
@@ -278,7 +279,7 @@ async def websocket_handler(ws: WebSocket):
     transcript_stream = deepgram_listener().__aiter__()
 
     # =====================================================
-    # MAIN LOOP (UNCHANGED EXCEPT SAMPLE LOG)
+    # MAIN LOOP
     # =====================================================
     try:
         while True:
@@ -299,13 +300,13 @@ async def websocket_handler(ws: WebSocket):
             audio_bytes = data["bytes"]
 
             # =====================================================
-            # 🔥 OPTION B — PCM ALIGNMENT FIX (ONLY CHANGE PART 1)
+            # 🔥 PCM ALIGNMENT FIX
             # =====================================================
             pcm = bytearray(audio_bytes)
             audio_bytes = bytes(pcm)
 
             # =====================================================
-            # 🔥 PCM SAMPLE LOGGING (ONLY CHANGE PART 2)
+            # 🔥 PCM SAMPLE LOGGING
             # =====================================================
             import struct
             try:
