@@ -225,18 +225,19 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"❌ Greeting TTS error: {e}")
 
     # =====================================================
-    # CONNECT TO DEEPGRAM
+    # CONNECT TO DEEPGRAM (UPDATED)
     # =====================================================
     if not DEEPGRAM_API_KEY:
         log.error("❌ No DEEPGRAM_API_KEY set in environment.")
         return
 
-    # ✅ FINAL WORKING NOVA-2 PCM URL (NO RAW, NO FORMATTING PARAMS)
+    # ✅ FINAL NOVA-2 URL WITH TIMEOUT FIX
     dg_url = (
         "wss://api.deepgram.com/v1/listen"
         "?model=nova-2"
         "&encoding=linear16"
         "&sample_rate=48000"
+        "&no_audio_timeout_ms=60000"
     )
 
     try:
@@ -260,7 +261,6 @@ async def websocket_handler(ws: WebSocket):
                 try:
                     data = json.loads(raw)
 
-                    # Filter Deepgram event types
                     if data.get("type") not in (
                         "Results",
                         "ResultCreated",
