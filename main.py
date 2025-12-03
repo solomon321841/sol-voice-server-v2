@@ -1,6 +1,8 @@
-# (Full file as you provided, with only the Deepgram/audio WebSocket handling section adjusted.)
-# I have left your other application logic untouched; only the DEEPGRAM connection, listener, and browser->Deepgram forwarding changed.
-
+# (Full file with a minimal, focused change: decouple audio forwarding from transcript processing.
+# The previous implementation awaited dg_queue.get() inside the audio-forwarding loop which blocked
+# reading further audio from the browser and caused Deepgram timeouts (1011). This version adds a
+# dedicated transcript_processor task that consumes transcripts from dg_queue asynchronously so
+# the audio-forwarding loop can continuously read and forward binary audio frames to Deepgram.)
 import os
 import json
 import logging
@@ -242,7 +244,6 @@ async def websocket_handler(ws: WebSocket):
                     if not isinstance(data, dict):
                         continue
 
-                    # Many Deepgram messages contain: {"type":"...","channel":{ "alternatives":[{"transcript":"..."}]}}
                     alts = []
                     if "channel" in data and isinstance(data["channel"], dict):
                         alts = data["channel"].get("alternatives", [])
@@ -286,7 +287,6 @@ async def websocket_handler(ws: WebSocket):
                         # 100ms silence at 48kHz mono = 4800 samples -> 9600 bytes
                         silence = (b'\x00\x00') * 4800
                         await dg_ws.send(silence)
-                        # log.debug("Sent backend silence keepalive to Deepgram")
                     except Exception as e:
                         log.error(f"❌ Error sending keepalive to Deepgram: {e}")
                         break
@@ -296,20 +296,140 @@ async def websocket_handler(ws: WebSocket):
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
     # =====================================================
-    # MAIN LOOP — receive raw bytes from browser and forward to Deepgram
+    # Transcript processor (NEW) — consumes dg_queue asynchronously so
+    # audio-forwarding loop is never blocked waiting for transcripts.
+    # =====================================================
+    async def transcript_processor():
+        nonlocal recent_msgs, processed_messages, prompt, last_audio_time
+        try:
+            while True:
+                try:
+                    transcript = await dg_queue.get()
+                except asyncio.CancelledError:
+                    break
+
+                if not transcript:
+                    continue
+
+                log.info(f"📝 DG transcript: {transcript}")
+
+                # Basic transcript sanity checks (same as original)
+                if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
+                    continue
+
+                msg = transcript
+                norm = _normalize(msg)
+                now = time.time()
+                recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
+                if any(_is_similar(m, norm) for (m, t) in recent_msgs):
+                    continue
+                recent_msgs.append((norm, now))
+
+                # Use memory & notion context as before
+                mems = await mem0_search(user_id, msg)
+                ctx = memory_context(mems)
+                sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
+                lower = msg.lower()
+
+                # Plate logic
+                if any(k in lower for k in plate_kw):
+                    if msg in processed_messages:
+                        continue
+                    processed_messages.add(msg)
+
+                    reply = await send_to_n8n(N8N_PLATE_URL, msg)
+
+                    try:
+                        tts = await openai_client.audio.speech.create(
+                            model="gpt-4o-mini-tts",
+                            voice="alloy",
+                            input=reply
+                        )
+                        await ws.send_bytes(await tts.aread())
+                    except Exception as e:
+                        log.error(f"❌ TTS plate error: {e}")
+                    continue
+
+                # Calendar logic
+                if any(k in lower for k in calendar_kw):
+                    reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
+
+                    try:
+                        tts = await openai_client.audio.speech.create(
+                            model="gpt-4o-mini-tts",
+                            voice="alloy",
+                            input=reply
+                        )
+                        await ws.send_bytes(await tts.aread())
+                    except Exception as e:
+                        log.error(f"❌ TTS calendar error: {e}")
+
+                    continue
+
+                # General GPT logic
+                try:
+                    stream = await openai_client.chat.completions.create(
+                        model=GPT_MODEL,
+                        messages=[
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user", "content": msg},
+                        ],
+                        stream=True,
+                    )
+
+                    buffer = ""
+
+                    async for chunk in stream:
+                        delta = getattr(chunk.choices[0].delta, "content", "")
+                        if delta:
+                            buffer += delta
+
+                            if len(buffer) > 40:
+                                try:
+                                    tts = await openai_client.audio.speech.create(
+                                        model="gpt-4o-mini-tts",
+                                        voice="alloy",
+                                        input=buffer
+                                    )
+                                    await ws.send_bytes(await tts.aread())
+                                except Exception as e:
+                                    log.error(f"❌ TTS stream-chunk error: {e}")
+                                buffer = ""
+
+                    if buffer.strip():
+                        try:
+                            tts = await openai_client.audio.speech.create(
+                                model="gpt-4o-mini-tts",
+                                voice="alloy",
+                                input=buffer
+                            )
+                            await ws.send_bytes(await tts.aread())
+                        except Exception as e:
+                            log.error(f"❌ TTS final-chunk error: {e}")
+
+                    asyncio.create_task(mem0_add(user_id, msg))
+
+                except Exception as e:
+                    log.error(f"LLM error: {e}")
+
+        except Exception as e:
+            log.error(f"❌ transcript_processor fatal: {e}")
+
+    transcript_task = asyncio.create_task(transcript_processor())
+
+    # =====================================================
+    # MAIN LOOP — receive raw bytes from browser and forward to Deepgram (no blocking)
     # =====================================================
     try:
         while True:
             try:
-                # Use receive_bytes for clarity and to guarantee binary payload
+                # Use receive_bytes to ensure we get binary payloads quickly
                 audio_bytes = await ws.receive_bytes()
             except WebSocketDisconnect:
                 log.info("Browser websocket disconnected")
                 break
             except Exception as e:
-                # Receive could raise if non-binary frame or connection issue
                 log.error(f"WebSocket receive error: {e}")
-                # brief sleep to avoid tight loop on strange errors
                 await asyncio.sleep(0.05)
                 continue
 
@@ -344,135 +464,26 @@ async def websocket_handler(ws: WebSocket):
             except Exception as e:
                 log.error(f"PCM stats error: {e}")
 
-            # FORWARD RAW PCM BYTES DIRECTLY TO DEEPGRAM
+            # FORWARD RAW PCM BYTES DIRECTLY TO DEEPGRAM (non-blocking)
             try:
                 await dg_ws.send(audio_bytes)
             except Exception as e:
                 log.error(f"❌ Error sending audio to Deepgram WS: {e}")
-                # Optionally try reconnect; for now continue and let keepalive attempt help
+                # continue forwarding future frames; keepalive_task will try to maintain DG session
                 continue
 
-            # READ A TRANSCRIPT (if any available) with short timeout so main loop remains responsive
-            transcript = ""
-            try:
-                transcript = await asyncio.wait_for(dg_queue.get(), timeout=1.0)
-                log.info(f"📝 DG transcript: {transcript}")
-            except asyncio.TimeoutError:
-                # no transcript yet; continue sending audio
-                continue
-            except Exception as e:
-                log.error(f"Error getting transcript from DG queue: {e}")
-                continue
-
-            # Basic transcript sanity checks
-            if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
-                continue
-
-            msg = transcript
-            norm = _normalize(msg)
-            now = time.time()
-            recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
-            if any(_is_similar(m, norm) for (m, t) in recent_msgs):
-                continue
-            recent_msgs.append((norm, now))
-
-            mems = await mem0_search(user_id, msg)
-            ctx = memory_context(mems)
-            sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
-            lower = msg.lower()
-
-            # =====================================================
-            # NOTION PLATE LOGIC (unchanged)
-            # =====================================================
-            if any(k in lower for k in plate_kw):
-                if msg in processed_messages:
-                    continue
-                processed_messages.add(msg)
-
-                reply = await send_to_n8n(N8N_PLATE_URL, msg)
-
-                try:
-                    tts = await openai_client.audio.speech.create(
-                        model="gpt-4o-mini-tts",
-                        voice="alloy",
-                        input=reply
-                    )
-                    await ws.send_bytes(await tts.aread())
-                except Exception as e:
-                    log.error(f"❌ TTS plate error: {e}")
-                continue
-
-            # =====================================================
-            # CALENDAR LOGIC (unchanged)
-            # =====================================================
-            if any(k in lower for k in calendar_kw):
-                reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
-
-                try:
-                    tts = await openai_client.audio.speech.create(
-                        model="gpt-4o-mini-tts",
-                        voice="alloy",
-                        input=reply
-                    )
-                    await ws.send_bytes(await tts.aread())
-                except Exception as e:
-                    log.error(f"❌ TTS calendar error: {e}")
-
-                continue
-
-            # =====================================================
-            # GENERAL GPT LOGIC (unchanged)
-            # =====================================================
-            try:
-                stream = await openai_client.chat.completions.create(
-                    model=GPT_MODEL,
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": msg},
-                    ],
-                    stream=True,
-                )
-
-                buffer = ""
-
-                async for chunk in stream:
-                    delta = getattr(chunk.choices[0].delta, "content", "")
-                    if delta:
-                        buffer += delta
-
-                        if len(buffer) > 40:
-                            try:
-                                tts = await openai_client.audio.speech.create(
-                                    model="gpt-4o-mini-tts",
-                                    voice="alloy",
-                                    input=buffer
-                                )
-                                await ws.send_bytes(await tts.aread())
-                            except Exception as e:
-                                log.error(f"❌ TTS stream-chunk error: {e}")
-                            buffer = ""
-
-                if buffer.strip():
-                    try:
-                        tts = await openai_client.audio.speech.create(
-                            model="gpt-4o-mini-tts",
-                            voice="alloy",
-                            input=buffer
-                        )
-                        await ws.send_bytes(await tts.aread())
-                    except Exception as e:
-                        log.error(f"❌ TTS final-chunk error: {e}")
-
-                asyncio.create_task(mem0_add(user_id, msg))
-
-            except Exception as e:
-                log.error(f"LLM error: {e}")
+            # Do NOT wait for transcript here; transcript_task will consume dg_queue independently
 
     except WebSocketDisconnect:
         pass
     finally:
+        # cleanup tasks & sockets
         try:
             keepalive_task.cancel()
+        except:
+            pass
+        try:
+            transcript_task.cancel()
         except:
             pass
         try:
