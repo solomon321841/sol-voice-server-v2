@@ -188,7 +188,7 @@ async def websocket_handler(ws: WebSocket):
     # GREETING TTS (unchanged)
     try:
         tts_greet = await openai_client.audio.speech.create(
-            model="gpt-5.1-tts",
+            model="gpt-4o-mini-tts",
             voice="alloy",
             input=greet
         )
