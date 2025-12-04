@@ -3,8 +3,6 @@ import json
 import logging
 import asyncio
 import time
-import random
-import string
 from typing import List, Dict
 from dotenv import load_dotenv
 import httpx
@@ -33,14 +31,11 @@ NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID", "").strip()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 
 # =====================================================
-# n8n ENDPOINTS
+# ENDPOINTS / MODEL
 # =====================================================
 N8N_CALENDAR_URL = "https://n8n.marshall321.org/webhook/calendar-agent"
 N8N_PLATE_URL = "https://n8n.marshall321.org/webhook/agent/plate"
 
-# =====================================================
-# MODEL
-# =====================================================
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 GPT_MODEL = "gpt-4o"
 
@@ -65,7 +60,7 @@ async def health():
     return {"ok": True}
 
 # =====================================================
-# Helpers (mem0, notion, n8n) - unchanged behaviour
+# Helpers (mem0, notion, n8n) - unchanged/simple
 # =====================================================
 async def mem0_search(user_id: str, query: str):
     if not MEMO_API_KEY:
@@ -137,7 +132,6 @@ async def send_to_n8n(url: str, message: str) -> str:
         async with httpx.AsyncClient(timeout=20) as c:
             r = await c.post(url, json={"message": message})
             log.info(f"📩 n8n raw response: {r.text}")
-
             if r.status_code == 200:
                 try:
                     data = r.json()
@@ -154,14 +148,13 @@ async def send_to_n8n(url: str, message: str) -> str:
                     return str(data)
                 except:
                     return r.text.strip()
-
             return "Sorry, the automation returned an unexpected response."
     except Exception as e:
         log.error(f"n8n error: {e}")
         return "Sorry, couldn't reach automation."
 
 # =====================================================
-# Normalization
+# Normalization helpers
 # =====================================================
 def _normalize(m: str):
     m = m.lower().strip()
@@ -172,17 +165,12 @@ def _is_similar(a: str, b: str):
     return bool(a and b and (a == b or a.startswith(b) or b.startswith(a) or a in b or b in a))
 
 # =====================================================
-# MAIN WEBSOCKET HANDLER
-# - Supports:
-#   * streaming LLM -> incremental TTS (fast)
-#   * cancellable LLM stream and cancellable TTS sends on client interrupt
-#   * robust ws reader and deepgram forwarding
+# Websocket handler (streaming + interrupt + debounce of transcripts)
 # =====================================================
 @app.websocket("/ws")
 async def websocket_handler(ws: WebSocket):
     await ws.accept()
 
-    # session variables
     user_id = "solomon_roth"
     recent_msgs = []
     processed_messages = set()
@@ -192,10 +180,10 @@ async def websocket_handler(ws: WebSocket):
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
 
-    # conversation history for context (system prompt as first message)
+    # Conversation context
     session_messages: List[Dict] = [{"role": "system", "content": prompt}]
 
-    # greeting TTS
+    # greeting
     try:
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
@@ -204,13 +192,13 @@ async def websocket_handler(ws: WebSocket):
         )
         await ws.send_bytes(await tts_greet.aread())
     except Exception as e:
-        log.error(f"❌ Greeting TTS error: {e}")
+        log.error(f"Greeting TTS error: {e}")
 
     # =====================================================
-    # Deepgram connect
+    # connect to Deepgram
     # =====================================================
     if not DEEPGRAM_API_KEY:
-        log.error("❌ No DEEPGRAM_API_KEY set.")
+        log.error("No DEEPGRAM_API_KEY set.")
         return
 
     dg_url = (
@@ -229,12 +217,11 @@ async def websocket_handler(ws: WebSocket):
             close_timeout=0
         )
     except Exception as e:
-        log.error(f"❌ Failed to connect to Deepgram WS: {e}")
+        log.error(f"Failed to connect to Deepgram WS: {e}")
         return
 
     # =====================================================
-    # Deepgram listener: push transcripts into dg_queue
-    # - we'll accept both partial and final, but tag them so transcript_processor can decide
+    # Deepgram listener: put (transcript, is_final) into dg_queue
     # =====================================================
     dg_queue = Queue()
 
@@ -246,23 +233,24 @@ async def websocket_handler(ws: WebSocket):
                         raw_text = raw.decode("utf-8", errors="ignore")
                     else:
                         raw_text = raw
-
                     data = json.loads(raw_text)
                     if not isinstance(data, dict):
                         continue
 
-                    # Extract transcript if present
                     transcript = ""
                     is_final = False
 
-                    # Try standard shapes
                     if "channel" in data and isinstance(data["channel"], dict):
                         alts = data["channel"].get("alternatives", [])
                         if alts and isinstance(alts[0], dict):
                             transcript = alts[0].get("transcript", "").strip()
                             is_final = bool(alts[0].get("is_final") or data.get("type") in ("UtteranceEnd", "UtteranceFinal"))
                     elif "results" in data and isinstance(data["results"], dict):
-                        alts = data["results"].get("alternatives", [])
+                        ch = data["results"].get("channels", [])
+                        if ch and isinstance(ch, list):
+                            alts = ch[0].get("alternatives", [])
+                        else:
+                            alts = data["results"].get("alternatives", [])
                         if alts and isinstance(alts[0], dict):
                             transcript = alts[0].get("transcript", "").strip()
                             is_final = bool(alts[0].get("is_final") or data.get("is_final"))
@@ -272,20 +260,16 @@ async def websocket_handler(ws: WebSocket):
                             is_final = bool(data.get("is_final"))
 
                     if transcript:
-                        # push tuple (transcript, is_final)
                         await dg_queue.put((transcript, bool(is_final)))
                 except Exception as e:
-                    log.error(f"❌ DG parse error: {e}")
+                    log.error(f"DG parse error: {e}")
         except Exception as e:
-            log.error(f"❌ DG listener fatal: {e}")
+            log.error(f"DG listener fatal: {e}")
 
     dg_listener = asyncio.create_task(deepgram_listener_task())
 
-    # =====================================================
-    # Backend keepalive to Deepgram
-    # =====================================================
+    # keepalive to Deepgram
     last_audio_time = time.time()
-
     async def dg_keepalive_task():
         nonlocal last_audio_time
         try:
@@ -296,26 +280,19 @@ async def websocket_handler(ws: WebSocket):
                         silence = (b'\x00\x00') * 4800
                         await dg_ws.send(silence)
                     except Exception as e:
-                        log.error(f"❌ Error sending keepalive to Deepgram: {e}")
+                        log.error(f"Error sending keepalive to Deepgram: {e}")
                         break
         except asyncio.CancelledError:
             return
-
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
     # =====================================================
-    # Cancellable tasks (for interruption behavior)
-    # - current_stream_task: running LLM streaming -> produces incremental text
-    # - current_tts_task: sending generated TTS bytes to client (cancellable)
+    # cancellable tasks
     # =====================================================
     current_stream_task = None
     current_tts_task = None
 
     async def send_tts_bytes(tts_audio_creator):
-        """
-        Await tts_audio_creator() to get bytes, then send them to the client.
-        This is cancellable via the task that wraps this function.
-        """
         nonlocal current_tts_task
         try:
             audio_bytes = await tts_audio_creator()
@@ -325,31 +302,24 @@ async def websocket_handler(ws: WebSocket):
                 await ws.send_bytes(audio_bytes)
                 log.info("TTS chunk sent to client (len=%d)", len(audio_bytes))
             except Exception as e:
-                log.error(f"❌ Error sending TTS bytes to client: {e}")
+                log.error(f"Error sending TTS bytes to client: {e}")
         except asyncio.CancelledError:
-            log.info("send_tts_bytes: cancelled (client interrupted)")
+            log.info("send_tts_bytes: cancelled (client interrupt)")
         except Exception as e:
-            log.error(f"❌ send_tts_bytes error: {e}")
+            log.error(f"send_tts_bytes error: {e}")
         finally:
             if asyncio.current_task() is current_tts_task:
                 current_tts_task = None
 
     # =====================================================
-    # Helper: process a single user message by streaming LLM and producing incremental TTS
-    # - Maintains session_messages for context
-    # - Sends TTS incrementally: takes text from last_sent_index -> current buffer when
-    #   text length exceeds thresholds or ends with punctuation.
-    # - Honors cancellation: cancelling current_stream_task will stop generating more TTS.
+    # LLM streaming + incremental TTS producer
     # =====================================================
     async def run_llm_stream_and_tts(user_message_text: str):
         nonlocal current_tts_task, current_stream_task, session_messages
 
-        # Add user's utterance into session history (so LLM has context)
         session_messages.append({"role": "user", "content": user_message_text})
 
-        # We'll stream the LLM response and send incremental TTS parts.
         try:
-            # Start streaming completion
             stream = await openai_client.chat.completions.create(
                 model=GPT_MODEL,
                 messages=session_messages,
@@ -362,26 +332,19 @@ async def websocket_handler(ws: WebSocket):
         full_response = ""
         last_sent_idx = 0
 
-        # heuristics for when to send a TTS chunk
-        MIN_CHARS_FOR_TTS = 60       # minimum chars to wait before generating TTS chunk
-        SEND_ON_PUNCTUATION = True   # send if chunk ends with .,!? to reduce mid-sentence chunks
+        MIN_CHARS_FOR_TTS = 60
+        SEND_ON_PUNCTUATION = True
 
         async def maybe_send_chunk():
             nonlocal last_sent_idx, full_response, current_tts_task
-            # compute candidate substring
             if last_sent_idx >= len(full_response):
                 return
             candidate = full_response[last_sent_idx:].strip()
             if not candidate:
                 return
-
-            # Decide whether to send now
             if len(candidate) < MIN_CHARS_FOR_TTS:
-                # try to send if ends with punctuation and allowed
                 if not SEND_ON_PUNCTUATION or candidate[-1] not in ".!?":
                     return
-
-            # Prepare TTS bytes for this candidate substring
             async def make_tts_for(text=candidate):
                 try:
                     tts = await openai_client.audio.speech.create(
@@ -393,46 +356,34 @@ async def websocket_handler(ws: WebSocket):
                 except Exception as e:
                     log.error(f"Error generating TTS: {e}")
                     return b""
-
-            # Cancel previous outgoing TTS (we stream and show latest)
             if current_tts_task and not current_tts_task.done():
                 try:
                     current_tts_task.cancel()
                     log.info("Cancelled previous TTS task before sending new chunk")
                 except Exception as e:
                     log.error(f"Error cancelling current_tts_task: {e}")
-
-            # Spawn task to send bytes (cancellable)
             current_tts_task = asyncio.create_task(send_tts_bytes(make_tts_for))
-            # advance last_sent_idx to end of full_response (we consider we've sent it)
             last_sent_idx = len(full_response)
 
         try:
-            # iterate stream chunks
             async for chunk in stream:
-                # extract delta content
                 delta = getattr(chunk.choices[0].delta, "content", "")
                 if delta:
                     full_response += delta
-                    # consider sending incremental TTS if thresholds met
                     await maybe_send_chunk()
-                # If task cancellation requested, break early
                 if asyncio.current_task().cancelled():
                     log.info("LLM stream task cancelled mid-stream")
                     break
 
-            # After stream completes, send any remaining text
+            # final remainder
             if len(full_response.strip()) > last_sent_idx:
-                # final remainder
                 remainder = full_response[last_sent_idx:].strip()
                 if remainder:
-                    # cancel previous TTS (to ensure no overlap)
                     if current_tts_task and not current_tts_task.done():
                         try:
                             current_tts_task.cancel()
                         except Exception as e:
                             log.error(f"Error cancelling current_tts_task: {e}")
-
                     async def make_tts_final(text=remainder):
                         try:
                             tts = await openai_client.audio.speech.create(
@@ -444,39 +395,88 @@ async def websocket_handler(ws: WebSocket):
                         except Exception as e:
                             log.error(f"Error generating final TTS: {e}")
                             return b""
-
                     current_tts_task = asyncio.create_task(send_tts_bytes(make_tts_final))
-                    # mark that we've sent all
                     last_sent_idx = len(full_response)
 
-            # Append assistant reply to session history for context
             assistant_content = full_response.strip()
             if assistant_content:
                 session_messages.append({"role": "assistant", "content": assistant_content})
-                # Optionally store to mem0
             return
         except asyncio.CancelledError:
-            # If we are cancelled because client interrupted, stop generating and return.
             log.info("run_llm_stream_and_tts: cancelled due to client interrupt")
-            # Cancel any outstanding TTS send
             if current_tts_task and not current_tts_task.done():
                 try:
                     current_tts_task.cancel()
                 except Exception as e:
                     log.error(f"Error cancelling current_tts_task on stream cancel: {e}")
-            # Do not append partial assistant text to session history (avoids sticking partially)
             return
         except Exception as e:
             log.error(f"LLM stream error: {e}")
             return
 
     # =====================================================
-    # Transcript processor: consumes dg_queue items (transcript, is_final)
-    # - For speed we will start processing on the first useful transcript (even partial).
-    # - If the client sends an explicit interrupt, we cancel current_stream_task & current_tts_task.
+    # Transcript processing with DEBOUNCE logic to avoid reacting to every partial
     # =====================================================
+    DEBOUNCE_MS = 400         # milliseconds to wait for more partial transcripts before processing
+    MIN_WORDS_TO_PROCESS = 1  # minimum words to accept for processing (adjust as needed)
+
+    pending_transcript = None
+    pending_is_final = False
+    debounce_task = None
+    debounce_lock = asyncio.Lock()
+
+    async def process_pending_transcript():
+        nonlocal pending_transcript, pending_is_final, current_stream_task, current_tts_task
+        async with debounce_lock:
+            if not pending_transcript:
+                return
+            text = pending_transcript.strip()
+            pending_transcript = None
+            pending_is_final = False
+
+        # basic sanity
+        if not text or len(text) < 1:
+            return
+        if sum(1 for w in text.split() if w.strip()) < MIN_WORDS_TO_PROCESS:
+            log.info("Skipping very short transcript")
+            return
+
+        log.info(f"Processing transcript (debounced): {text}")
+
+        # cancel any running stream / tts to prioritize this new utterance
+        if current_stream_task and not current_stream_task.done():
+            try:
+                current_stream_task.cancel()
+                log.info("Cancelled ongoing LLM stream due to new transcript")
+            except Exception as e:
+                log.error(f"Error cancelling current_stream_task: {e}")
+        if current_tts_task and not current_tts_task.done():
+            try:
+                current_tts_task.cancel()
+                log.info("Cancelled outgoing TTS due to new transcript")
+            except Exception as e:
+                log.error(f"Error cancelling current_tts_task: {e}")
+
+        # start a new LLM streaming task (background)
+        current_stream_task = asyncio.create_task(run_llm_stream_and_tts(text))
+
+    async def schedule_debounce_and_process():
+        nonlocal debounce_task
+        # cancel previous debounce
+        if debounce_task and not debounce_task.done():
+            debounce_task.cancel()
+        async def _wait_and_run():
+            try:
+                await asyncio.sleep(DEBOUNCE_MS / 1000.0)
+                await process_pending_transcript()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.error(f"debounce inner error: {e}")
+        debounce_task = asyncio.create_task(_wait_and_run())
+
     async def transcript_processor():
-        nonlocal current_stream_task, current_tts_task, session_messages, recent_msgs
+        nonlocal pending_transcript, pending_is_final
         try:
             while True:
                 try:
@@ -487,45 +487,48 @@ async def websocket_handler(ws: WebSocket):
                 if not transcript:
                     continue
 
-                # rate-limit / dedupe
-                log.info(f"📝 DG transcript (final={is_final}): {transcript}")
-                if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
+                log.info(f"DG transcript (final={is_final}): {transcript}")
+
+                # quick filter
+                if len(transcript.strip()) < 1 or not any(ch.isalpha() for ch in transcript):
                     continue
 
+                # normalization + dedupe
                 norm = _normalize(transcript)
                 now = time.time()
-                recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
+                nonlocal_recent = [(m, t) for (m, t) in recent_msgs if now - t < 2]
+                # use existing recent_msgs array
+                recent_msgs[:] = nonlocal_recent
                 if any(_is_similar(m, norm) for (m, t) in recent_msgs):
+                    log.info("Duplicate/very-similar transcript — ignoring")
                     continue
                 recent_msgs.append((norm, now))
 
-                # Immediately start processing the user transcript to be fast (stream LLM)
-                # Cancel any existing LLM stream or outgoing TTS (we treat this as a new user utterance)
-                if current_stream_task and not current_stream_task.done():
-                    try:
-                        current_stream_task.cancel()
-                        log.info("Cancelled ongoing LLM stream due to new transcript")
-                    except Exception as e:
-                        log.error(f"Error cancelling current_stream_task: {e}")
+                # If final, process immediately
+                if is_final:
+                    # set pending and cancel debounce to process right away
+                    async with debounce_lock:
+                        pending_transcript = transcript
+                        pending_is_final = True
+                    if debounce_task and not debounce_task.done():
+                        debounce_task.cancel()
+                    await process_pending_transcript()
+                    continue
 
-                if current_tts_task and not current_tts_task.done():
-                    try:
-                        current_tts_task.cancel()
-                        log.info("Cancelled outgoing TTS due to new transcript")
-                    except Exception as e:
-                        log.error(f"Error cancelling current_tts_task: {e}")
-
-                # Kick off LLM streaming + incremental TTS for this utterance
-                # We don't await here; run in background so processor can keep consuming Deepgram partials
-                current_stream_task = asyncio.create_task(run_llm_stream_and_tts(transcript))
+                # Not final -> update pending_transcript and schedule debounce
+                async with debounce_lock:
+                    # append or replace with latest partial (we keep latest partial)
+                    pending_transcript = transcript
+                    pending_is_final = False
+                await schedule_debounce_and_process()
 
         except Exception as e:
-            log.error(f"❌ transcript_processor fatal: {e}")
+            log.error(f"transcript_processor fatal: {e}")
 
     transcript_task = asyncio.create_task(transcript_processor())
 
     # =====================================================
-    # SINGLE WS READER: isolate ws.receive into one task and feed incoming_queue
+    # Single ws reader & main loop: same robust pattern used earlier
     # =====================================================
     incoming_queue = asyncio.Queue()
 
@@ -535,17 +538,17 @@ async def websocket_handler(ws: WebSocket):
                 try:
                     data = await ws.receive()
                 except WebSocketDisconnect:
-                    log.info("ws_reader_task: WebSocketDisconnect received")
+                    log.info("ws_reader_task: WebSocketDisconnect")
                     await incoming_queue.put({"type": "disconnect", "reason": "WebSocketDisconnect"})
                     break
                 except RuntimeError as e:
                     msg = str(e)
-                    log.info(f"ws_reader_task RuntimeError during ws.receive(): {msg}")
+                    log.info(f"ws_reader_task RuntimeError: {msg}")
                     await incoming_queue.put({"type": "disconnect", "reason": msg})
                     break
                 except Exception as e:
                     msg = str(e)
-                    log.error(f"ws_reader_task unexpected receive error: {msg}")
+                    log.error(f"ws_reader_task receive error: {msg}")
                     await incoming_queue.put({"type": "disconnect", "reason": msg})
                     break
                 await incoming_queue.put(data)
@@ -557,46 +560,47 @@ async def websocket_handler(ws: WebSocket):
     reader = asyncio.create_task(ws_reader_task())
 
     # =====================================================
-    # MAIN loop: consume incoming_queue (control frames, audio bytes)
-    # - Accept control frames: {"control":"interrupt"} to cancel current_stream_task & current_tts_task
-    # - Forward binary audio to Deepgram
+    # MAIN: handle incoming_queue: control frames + binary audio
+    # control example: {"control":"interrupt"}
     # =====================================================
     try:
         while True:
             item = await incoming_queue.get()
             if not item:
                 continue
-
             if isinstance(item, dict) and item.get("type") == "disconnect":
                 log.info(f"Reader reported disconnect: {item.get('reason')}")
                 break
-
             data = item
-            # Handle text control frames
+
+            # handle text control messages
             if data.get("type") == "websocket.receive" and data.get("text") is not None:
                 txt = data["text"]
                 try:
                     obj = json.loads(txt)
                     if isinstance(obj, dict) and obj.get("control") == "interrupt":
-                        log.info("🔴 Client interrupt control received — cancelling current stream & TTS.")
-                        # cancel LLM streaming
+                        log.info("Client interrupt control received — cancelling current stream & TTS.")
                         if current_stream_task and not current_stream_task.done():
                             try:
                                 current_stream_task.cancel()
                                 log.info("Requested cancellation of current_stream_task")
                             except Exception as e:
                                 log.error(f"Error cancelling current_stream_task: {e}")
-                        # cancel outgoing TTS
                         if current_tts_task and not current_tts_task.done():
                             try:
                                 current_tts_task.cancel()
                                 log.info("Requested cancellation of current_tts_task")
                             except Exception as e:
                                 log.error(f"Error cancelling current_tts_task: {e}")
-                        # Clear any server-side queued TTS (we don't maintain a separate queue)
+                        # clear pending transcript so we don't resume processing an old partial
+                        async with debounce_lock:
+                            nonlocal pending_transcript  # type: ignore
+                            pending_transcript = None
+                        # also cancel debounce
+                        if debounce_task and not debounce_task.done():
+                            debounce_task.cancel()
                         continue
                 except Exception:
-                    # ignore non-control text
                     pass
 
             # binary audio frames
@@ -604,14 +608,12 @@ async def websocket_handler(ws: WebSocket):
                 continue
 
             audio_bytes = data["bytes"]
-
-            # ensure even-length (16-bit alignment)
             if len(audio_bytes) % 2 != 0:
                 audio_bytes = audio_bytes + b'\x00'
 
             last_audio_time = time.time()
 
-            # PCM logging
+            # PCM logs / stats
             import struct
             try:
                 if len(audio_bytes) >= 20:
@@ -621,8 +623,6 @@ async def websocket_handler(ws: WebSocket):
                 log.debug(f"sample unpack error: {e}")
 
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
-
-            # PCM stats
             try:
                 if len(audio_bytes) >= 2:
                     total_samples = len(audio_bytes) // 2
@@ -633,11 +633,11 @@ async def websocket_handler(ws: WebSocket):
             except Exception as e:
                 log.error(f"PCM stats error: {e}")
 
-            # Forward raw PCM to Deepgram
+            # forward to Deepgram
             try:
                 await dg_ws.send(audio_bytes)
             except Exception as e:
-                log.error(f"❌ Error sending audio to Deepgram WS: {e}")
+                log.error(f"Error sending audio to Deepgram WS: {e}")
                 continue
 
     except Exception as e:
@@ -655,6 +655,11 @@ async def websocket_handler(ws: WebSocket):
         try:
             if transcript_task:
                 transcript_task.cancel()
+        except:
+            pass
+        try:
+            if debounce_task and not debounce_task.done():
+                debounce_task.cancel()
         except:
             pass
         try:
