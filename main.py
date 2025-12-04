@@ -287,7 +287,7 @@ async def websocket_handler(ws: WebSocket):
     asyncio.create_task(deepgram_listener_task())
 
     # =====================================================
-    # Backend keepalive: send silence to Deepgram when no audio forwarded
+    # BACKEND KEEPALIVE
     # =====================================================
     last_audio_time = time.time()
 
@@ -309,16 +309,11 @@ async def websocket_handler(ws: WebSocket):
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
     # =====================================================
-    # CANCELLABLE TTS SENDING: maintain current_tts_task which can be cancelled by client interrupt
+    # CANCELLABLE TTS SENDING
     # =====================================================
     current_tts_task = None
 
     async def send_tts_bytes(tts_audio_creator):
-        """
-        tts_audio_creator: coroutine function that, when awaited, returns the audio bytes to send.
-        This function awaits the generator, then sends bytes to the websocket. It can be cancelled
-        by cancelling the task that wraps this function.
-        """
         nonlocal current_tts_task
         try:
             audio_bytes = await tts_audio_creator()
@@ -330,17 +325,14 @@ async def websocket_handler(ws: WebSocket):
                 log.error(f"❌ Error sending TTS bytes to client: {e}")
         except asyncio.CancelledError:
             log.info("TTS send task cancelled due to client interrupt.")
-            # allow cancellation to propagate silently
         except Exception as e:
             log.error(f"❌ send_tts_bytes error: {e}")
         finally:
-            # clear current_tts_task if it points to this task
             if asyncio.current_task() is current_tts_task:
                 current_tts_task = None
 
     # =====================================================
-    # Transcript processor: consumes dg_queue and runs your existing logic,
-    # but uses cancellable TTS send tasks instead of direct await ws.send_bytes(...)
+    # TRANSCRIPT PROCESSOR
     # =====================================================
     async def transcript_processor():
         nonlocal recent_msgs, processed_messages, prompt, current_tts_task
@@ -389,7 +381,6 @@ async def websocket_handler(ws: WebSocket):
                             )
                             return await tts.aread()
 
-                        # cancel previous outgoing TTS if any
                         if current_tts_task and not current_tts_task.done():
                             try:
                                 current_tts_task.cancel()
@@ -443,7 +434,6 @@ async def websocket_handler(ws: WebSocket):
                             buffer += delta
 
                             if len(buffer) > 40:
-                                # create tts task for partial buffer
                                 partial = buffer
                                 buffer = ""
 
@@ -455,7 +445,6 @@ async def websocket_handler(ws: WebSocket):
                                     )
                                     return await tts.aread()
 
-                                # cancel previous outgoing TTS if any
                                 if current_tts_task and not current_tts_task.done():
                                     try:
                                         current_tts_task.cancel()
@@ -464,7 +453,6 @@ async def websocket_handler(ws: WebSocket):
 
                                 current_tts_task = asyncio.create_task(send_tts_bytes(make_tts_partial))
 
-                    # final buffer
                     if buffer.strip():
                         final_text = buffer
 
@@ -495,22 +483,39 @@ async def websocket_handler(ws: WebSocket):
     transcript_task = asyncio.create_task(transcript_processor())
 
     # =====================================================
-    # MAIN receive loop: accept both binary audio frames and JSON control messages
+    # MAIN RECEIVE LOOP (robust handling of disconnects)
     # =====================================================
     try:
         while True:
             try:
                 data = await ws.receive()
             except WebSocketDisconnect:
-                log.info("Browser websocket disconnected")
+                log.info("Browser websocket disconnected (WebSocketDisconnect)")
+                break
+            except RuntimeError as e:
+                # This RuntimeError often carries the exact message you saw on Render:
+                # "Cannot call 'receive' once a disconnect message has been received."
+                msg = str(e)
+                log.info(f"RuntimeError during ws.receive(): {msg}")
+                # treat as disconnect and break
                 break
             except Exception as e:
+                # sometimes other exceptions indicate a closed/closing socket; check message and bail
+                msg = str(e)
+                if "Cannot call \"receive\" once a disconnect message has been received" in msg or "already closed" in msg or "connection is closed" in msg:
+                    log.info(f"WS appears closed: {msg}")
+                    break
                 log.error(f"WebSocket receive error: {e}")
                 await asyncio.sleep(0.05)
                 continue
 
-            # Handle text control messages (e.g., {"control":"interrupt"})
-            if data["type"] == "websocket.receive" and "text" in data and data["text"] is not None:
+            # Fast check: if framework returned a disconnect event dict, stop
+            if isinstance(data, dict) and data.get("type") == "websocket.disconnect":
+                log.info("Browser websocket sent disconnect event")
+                break
+
+            # handle text control messages
+            if isinstance(data, dict) and data.get("type") == "websocket.receive" and data.get("text") is not None:
                 txt = data["text"]
                 try:
                     obj = json.loads(txt)
@@ -521,14 +526,13 @@ async def websocket_handler(ws: WebSocket):
                                 current_tts_task.cancel()
                             except Exception as e:
                                 log.error(f"Error cancelling current_tts_task: {e}")
-                        # drop any server-side queued TTS (we don't maintain an explicit queue beyond current_tts_task)
                         continue
                 except Exception:
-                    # Not a control message, ignore
+                    # not a control frame, ignore
                     pass
 
-            # Binary frames: audio PCM from browser
-            if data["type"] != "websocket.receive" or "bytes" not in data or data["bytes"] is None:
+            # handle binary frames (audio)
+            if not isinstance(data, dict) or data.get("type") != "websocket.receive" or data.get("bytes") is None:
                 continue
 
             audio_bytes = data["bytes"]
@@ -568,10 +572,10 @@ async def websocket_handler(ws: WebSocket):
                 log.error(f"❌ Error sending audio to Deepgram WS: {e}")
                 continue
 
-            # do not wait for transcripts here; transcript_processor will consume dg_queue
     except WebSocketDisconnect:
         pass
     finally:
+        # cleanup tasks & sockets
         try:
             keepalive_task.cancel()
         except:
