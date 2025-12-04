@@ -66,7 +66,7 @@ async def health():
     return {"ok": True}
 
 # =====================================================
-# HELPERS (unchanged from your prior file)
+# MEM0 / NOTION / n8n helpers
 # =====================================================
 async def mem0_search(user_id: str, query: str):
     if not MEMO_API_KEY:
@@ -173,7 +173,7 @@ def _is_similar(a: str, b: str):
     return bool(a and b and (a == b or a.startswith(b) or b.startswith(a) or a in b or b in a))
 
 # =====================================================
-# WEBSOCKET HANDLER (robust receive via a single reader task)
+# WEBSOCKET HANDLER
 # =====================================================
 @app.websocket("/ws")
 async def websocket_handler(ws: WebSocket):
@@ -203,7 +203,7 @@ async def websocket_handler(ws: WebSocket):
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
 
-    # GREETING TTS
+    # GREETING TTS (unchanged)
     try:
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
@@ -241,7 +241,7 @@ async def websocket_handler(ws: WebSocket):
         return
 
     # =====================================================
-    # DEEPGRAM LISTENER -> pushes transcripts into dg_queue
+    # DEEPGRAM LISTENER -> push transcripts into dg_queue
     # =====================================================
     dg_queue = Queue()
 
@@ -255,28 +255,44 @@ async def websocket_handler(ws: WebSocket):
                         raw_text = raw
 
                     data = json.loads(raw_text)
-
                     if not isinstance(data, dict):
                         continue
 
+                    # Prefer to use explicit final indicators when available
+                    # Deepgram may include "is_final" in the alternatives or "type" fields
+                    is_final = False
                     alts = []
                     if "channel" in data and isinstance(data["channel"], dict):
                         alts = data["channel"].get("alternatives", [])
+                        # some payloads include is_final on alternative or a "is_final" key
+                        if alts and isinstance(alts[0], dict):
+                            is_final = bool(alts[0].get("is_final") or data.get("is_final") or data.get("type") in ("UtteranceEnd", "UtteranceFinal"))
                     elif "results" in data and isinstance(data["results"], dict):
                         ch = data["results"].get("channels", [])
                         if ch and isinstance(ch, list):
                             alts = ch[0].get("alternatives", [])
                         else:
                             alts = data["results"].get("alternatives", [])
+                        if alts and isinstance(alts[0], dict):
+                            is_final = bool(alts[0].get("is_final") or data.get("is_final"))
                     else:
-                        pass
+                        # fallback: look for 'transcript' in top-level keys
+                        alts = []
+                        if isinstance(data.get("transcript"), str):
+                            alts = [{"transcript": data.get("transcript")}]
 
                     transcript = ""
                     if alts and isinstance(alts, list):
                         transcript = alts[0].get("transcript", "").strip()
 
+                    # Guard: only enqueue when transcript is non-empty and either:
+                    # - Deepgram explicitly marked it final, or
+                    # - transcript length is reasonably long and contains alphabetic characters
                     if transcript:
-                        await dg_queue.put(transcript)
+                        # quick normalization for repeated content
+                        txt_norm = transcript.strip()
+                        if is_final or (len(txt_norm) >= 3 and any(ch.isalpha() for ch in txt_norm)):
+                            await dg_queue.put(txt_norm)
 
                 except Exception as e:
                     log.error(f"❌ DG parse error: {e}")
@@ -286,7 +302,7 @@ async def websocket_handler(ws: WebSocket):
     dg_listener = asyncio.create_task(deepgram_listener_task())
 
     # =====================================================
-    # BACKEND KEEPALIVE
+    # BACKEND KEEPALIVE: send silence to Deepgram when no audio forwarded
     # =====================================================
     last_audio_time = time.time()
 
@@ -308,7 +324,7 @@ async def websocket_handler(ws: WebSocket):
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
     # =====================================================
-    # CANCELLABLE TTS SENDING SUPPORT
+    # CANCELLABLE TTS SENDING
     # =====================================================
     current_tts_task = None
 
@@ -334,7 +350,8 @@ async def websocket_handler(ws: WebSocket):
                 current_tts_task = None
 
     # =====================================================
-    # TRANSCRIPT PROCESSOR (consumes dg_queue), uses send_tts_bytes for TTS
+    # TRANSCRIPT PROCESSOR (consumes dg_queue)
+    # - NOTE: removed partial/stream-chunk TTS generation. We only create TTS for final_text
     # =====================================================
     async def transcript_processor():
         nonlocal recent_msgs, processed_messages, prompt, current_tts_task
@@ -419,7 +436,7 @@ async def websocket_handler(ws: WebSocket):
                         log.error(f"❌ TTS calendar error: {e}")
                     continue
 
-                # GENERAL GPT LOGIC
+                # GENERAL GPT LOGIC (no partial TTS streaming; create single TTS after LLM completes)
                 try:
                     stream = await openai_client.chat.completions.create(
                         model=GPT_MODEL,
@@ -436,30 +453,10 @@ async def websocket_handler(ws: WebSocket):
                         delta = getattr(chunk.choices[0].delta, "content", "")
                         if delta:
                             buffer += delta
-
-                            if len(buffer) > 40:
-                                partial = buffer
-                                buffer = ""
-
-                                async def make_tts_partial(p=partial):
-                                    tts = await openai_client.audio.speech.create(
-                                        model="gpt-4o-mini-tts",
-                                        voice="alloy",
-                                        input=p
-                                    )
-                                    return await tts.aread()
-
-                                if current_tts_task and not current_tts_task.done():
-                                    log.info("Cancelling previous TTS before starting partial TTS")
-                                    try:
-                                        current_tts_task.cancel()
-                                    except Exception as e:
-                                        log.error(f"Error cancelling current TTS task: {e}")
-
-                                current_tts_task = asyncio.create_task(send_tts_bytes(make_tts_partial))
+                    # at this point the streaming is complete; buffer holds the full reply
 
                     if buffer.strip():
-                        final_text = buffer
+                        final_text = buffer.strip()
 
                         async def make_tts_final(p=final_text):
                             tts = await openai_client.audio.speech.create(
@@ -489,8 +486,7 @@ async def websocket_handler(ws: WebSocket):
     transcript_task = asyncio.create_task(transcript_processor())
 
     # =====================================================
-    # SINGLE READER TASK: reads from ws.receive() and pushes items into incoming_queue
-    # This isolates receive() to one location and gracefully handles disconnects.
+    # SINGLE READER TASK: read from ws.receive() and push to incoming_queue
     # =====================================================
     incoming_queue = asyncio.Queue()
 
@@ -514,9 +510,7 @@ async def websocket_handler(ws: WebSocket):
                     await incoming_queue.put({"type": "disconnect", "reason": msg})
                     break
 
-                # push the received frame into incoming_queue for the main loop to process
                 await incoming_queue.put(data)
-
         except asyncio.CancelledError:
             log.info("ws_reader_task cancelled")
         finally:
@@ -525,7 +519,7 @@ async def websocket_handler(ws: WebSocket):
     reader = asyncio.create_task(ws_reader_task())
 
     # =====================================================
-    # MAIN LOOP: consume incoming_queue rather than calling ws.receive() directly
+    # MAIN LOOP: consume incoming_queue
     # =====================================================
     try:
         while True:
@@ -533,12 +527,10 @@ async def websocket_handler(ws: WebSocket):
             if not item:
                 continue
 
-            # handle disconnect sentinel from reader
             if isinstance(item, dict) and item.get("type") == "disconnect":
                 log.info(f"Reader reported disconnect: {item.get('reason')}")
                 break
 
-            # item is expected to be a dict like Starlette returns from ws.receive()
             data = item
 
             # handle text control messages
@@ -556,22 +548,21 @@ async def websocket_handler(ws: WebSocket):
                                 log.error(f"Error cancelling current_tts_task: {e}")
                         continue
                 except Exception:
-                    # Not a control frame - ignore
                     pass
 
-            # binary audio frames handling
+            # handle binary audio frames
             if data.get("type") != "websocket.receive" or data.get("bytes") is None:
                 continue
 
             audio_bytes = data["bytes"]
 
-            # ensure even-length (16-bit alignment)
+            # ensure even-length
             if len(audio_bytes) % 2 != 0:
                 audio_bytes = audio_bytes + b'\x00'
 
             last_audio_time = time.time()
 
-            # PCM SAMPLE LOGGING (small sample)
+            # PCM LOGGING
             import struct
             try:
                 if len(audio_bytes) >= 20:
@@ -582,7 +573,7 @@ async def websocket_handler(ws: WebSocket):
 
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
 
-            # PCM STATS (RMS/Peak)
+            # PCM STATS
             try:
                 if len(audio_bytes) >= 2:
                     total_samples = len(audio_bytes) // 2
@@ -593,7 +584,7 @@ async def websocket_handler(ws: WebSocket):
             except Exception as e:
                 log.error(f"PCM stats error: {e}")
 
-            # Forward raw PCM bytes to Deepgram
+            # Forward to Deepgram
             try:
                 await dg_ws.send(audio_bytes)
             except Exception as e:
@@ -604,12 +595,10 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"Main loop unexpected error: {e}")
     finally:
         log.info("Main websocket handler cleaning up")
-        # cancel reader
         try:
             reader.cancel()
         except Exception:
             pass
-        # cancel other tasks
         try:
             keepalive_task.cancel()
         except:
