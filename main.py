@@ -66,7 +66,7 @@ async def health():
     return {"ok": True}
 
 # =====================================================
-# MEM0 / NOTION / n8n helpers (unchanged)
+# HELPERS (unchanged from your prior file)
 # =====================================================
 async def mem0_search(user_id: str, query: str):
     if not MEMO_API_KEY:
@@ -173,7 +173,7 @@ def _is_similar(a: str, b: str):
     return bool(a and b and (a == b or a.startswith(b) or b.startswith(a) or a in b or b in a))
 
 # =====================================================
-# MAIN WEBSOCKET HANDLER
+# WEBSOCKET HANDLER (robust receive via a single reader task)
 # =====================================================
 @app.websocket("/ws")
 async def websocket_handler(ws: WebSocket):
@@ -203,7 +203,7 @@ async def websocket_handler(ws: WebSocket):
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
 
-    # GREETING TTS (unchanged)
+    # GREETING TTS
     try:
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
@@ -241,7 +241,7 @@ async def websocket_handler(ws: WebSocket):
         return
 
     # =====================================================
-    # DEEPGRAM LISTENER -> push transcripts into dg_queue
+    # DEEPGRAM LISTENER -> pushes transcripts into dg_queue
     # =====================================================
     dg_queue = Queue()
 
@@ -269,7 +269,6 @@ async def websocket_handler(ws: WebSocket):
                         else:
                             alts = data["results"].get("alternatives", [])
                     else:
-                        # fallback: ignore
                         pass
 
                     transcript = ""
@@ -284,7 +283,7 @@ async def websocket_handler(ws: WebSocket):
         except Exception as e:
             log.error(f"❌ DG listener fatal: {e}")
 
-    asyncio.create_task(deepgram_listener_task())
+    dg_listener = asyncio.create_task(deepgram_listener_task())
 
     # =====================================================
     # BACKEND KEEPALIVE
@@ -309,18 +308,21 @@ async def websocket_handler(ws: WebSocket):
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
     # =====================================================
-    # CANCELLABLE TTS SENDING
+    # CANCELLABLE TTS SENDING SUPPORT
     # =====================================================
     current_tts_task = None
 
     async def send_tts_bytes(tts_audio_creator):
         nonlocal current_tts_task
         try:
+            log.info("TTS send task started")
             audio_bytes = await tts_audio_creator()
             if not audio_bytes:
+                log.info("TTS generator returned empty bytes")
                 return
             try:
                 await ws.send_bytes(audio_bytes)
+                log.info("TTS bytes successfully sent to client")
             except Exception as e:
                 log.error(f"❌ Error sending TTS bytes to client: {e}")
         except asyncio.CancelledError:
@@ -332,7 +334,7 @@ async def websocket_handler(ws: WebSocket):
                 current_tts_task = None
 
     # =====================================================
-    # TRANSCRIPT PROCESSOR
+    # TRANSCRIPT PROCESSOR (consumes dg_queue), uses send_tts_bytes for TTS
     # =====================================================
     async def transcript_processor():
         nonlocal recent_msgs, processed_messages, prompt, current_tts_task
@@ -382,6 +384,7 @@ async def websocket_handler(ws: WebSocket):
                             return await tts.aread()
 
                         if current_tts_task and not current_tts_task.done():
+                            log.info("Cancelling previous TTS before starting plate TTS")
                             try:
                                 current_tts_task.cancel()
                             except Exception as e:
@@ -405,6 +408,7 @@ async def websocket_handler(ws: WebSocket):
                             return await tts.aread()
 
                         if current_tts_task and not current_tts_task.done():
+                            log.info("Cancelling previous TTS before starting calendar TTS")
                             try:
                                 current_tts_task.cancel()
                             except Exception as e:
@@ -446,6 +450,7 @@ async def websocket_handler(ws: WebSocket):
                                     return await tts.aread()
 
                                 if current_tts_task and not current_tts_task.done():
+                                    log.info("Cancelling previous TTS before starting partial TTS")
                                     try:
                                         current_tts_task.cancel()
                                     except Exception as e:
@@ -465,6 +470,7 @@ async def websocket_handler(ws: WebSocket):
                             return await tts.aread()
 
                         if current_tts_task and not current_tts_task.done():
+                            log.info("Cancelling previous TTS before starting final TTS")
                             try:
                                 current_tts_task.cancel()
                             except Exception as e:
@@ -483,39 +489,60 @@ async def websocket_handler(ws: WebSocket):
     transcript_task = asyncio.create_task(transcript_processor())
 
     # =====================================================
-    # MAIN RECEIVE LOOP (robust handling of disconnects)
+    # SINGLE READER TASK: reads from ws.receive() and pushes items into incoming_queue
+    # This isolates receive() to one location and gracefully handles disconnects.
+    # =====================================================
+    incoming_queue = asyncio.Queue()
+
+    async def ws_reader_task():
+        try:
+            while True:
+                try:
+                    data = await ws.receive()
+                except WebSocketDisconnect:
+                    log.info("ws_reader_task: WebSocketDisconnect received")
+                    await incoming_queue.put({"type": "disconnect", "reason": "WebSocketDisconnect"})
+                    break
+                except RuntimeError as e:
+                    msg = str(e)
+                    log.info(f"ws_reader_task RuntimeError during ws.receive(): {msg}")
+                    await incoming_queue.put({"type": "disconnect", "reason": msg})
+                    break
+                except Exception as e:
+                    msg = str(e)
+                    log.error(f"ws_reader_task unexpected receive error: {msg}")
+                    await incoming_queue.put({"type": "disconnect", "reason": msg})
+                    break
+
+                # push the received frame into incoming_queue for the main loop to process
+                await incoming_queue.put(data)
+
+        except asyncio.CancelledError:
+            log.info("ws_reader_task cancelled")
+        finally:
+            log.info("ws_reader_task exiting")
+
+    reader = asyncio.create_task(ws_reader_task())
+
+    # =====================================================
+    # MAIN LOOP: consume incoming_queue rather than calling ws.receive() directly
     # =====================================================
     try:
         while True:
-            try:
-                data = await ws.receive()
-            except WebSocketDisconnect:
-                log.info("Browser websocket disconnected (WebSocketDisconnect)")
-                break
-            except RuntimeError as e:
-                # This RuntimeError often carries the exact message you saw on Render:
-                # "Cannot call 'receive' once a disconnect message has been received."
-                msg = str(e)
-                log.info(f"RuntimeError during ws.receive(): {msg}")
-                # treat as disconnect and break
-                break
-            except Exception as e:
-                # sometimes other exceptions indicate a closed/closing socket; check message and bail
-                msg = str(e)
-                if "Cannot call \"receive\" once a disconnect message has been received" in msg or "already closed" in msg or "connection is closed" in msg:
-                    log.info(f"WS appears closed: {msg}")
-                    break
-                log.error(f"WebSocket receive error: {e}")
-                await asyncio.sleep(0.05)
+            item = await incoming_queue.get()
+            if not item:
                 continue
 
-            # Fast check: if framework returned a disconnect event dict, stop
-            if isinstance(data, dict) and data.get("type") == "websocket.disconnect":
-                log.info("Browser websocket sent disconnect event")
+            # handle disconnect sentinel from reader
+            if isinstance(item, dict) and item.get("type") == "disconnect":
+                log.info(f"Reader reported disconnect: {item.get('reason')}")
                 break
 
+            # item is expected to be a dict like Starlette returns from ws.receive()
+            data = item
+
             # handle text control messages
-            if isinstance(data, dict) and data.get("type") == "websocket.receive" and data.get("text") is not None:
+            if data.get("type") == "websocket.receive" and data.get("text") is not None:
                 txt = data["text"]
                 try:
                     obj = json.loads(txt)
@@ -524,15 +551,16 @@ async def websocket_handler(ws: WebSocket):
                         if current_tts_task and not current_tts_task.done():
                             try:
                                 current_tts_task.cancel()
+                                log.info("Requested cancellation of current_tts_task")
                             except Exception as e:
                                 log.error(f"Error cancelling current_tts_task: {e}")
                         continue
                 except Exception:
-                    # not a control frame, ignore
+                    # Not a control frame - ignore
                     pass
 
-            # handle binary frames (audio)
-            if not isinstance(data, dict) or data.get("type") != "websocket.receive" or data.get("bytes") is None:
+            # binary audio frames handling
+            if data.get("type") != "websocket.receive" or data.get("bytes") is None:
                 continue
 
             audio_bytes = data["bytes"]
@@ -572,10 +600,16 @@ async def websocket_handler(ws: WebSocket):
                 log.error(f"❌ Error sending audio to Deepgram WS: {e}")
                 continue
 
-    except WebSocketDisconnect:
-        pass
+    except Exception as e:
+        log.error(f"Main loop unexpected error: {e}")
     finally:
-        # cleanup tasks & sockets
+        log.info("Main websocket handler cleaning up")
+        # cancel reader
+        try:
+            reader.cancel()
+        except Exception:
+            pass
+        # cancel other tasks
         try:
             keepalive_task.cancel()
         except:
@@ -588,6 +622,10 @@ async def websocket_handler(ws: WebSocket):
         try:
             if current_tts_task:
                 current_tts_task.cancel()
+        except:
+            pass
+        try:
+            dg_listener.cancel()
         except:
             pass
         try:
