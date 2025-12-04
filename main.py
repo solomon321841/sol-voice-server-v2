@@ -434,7 +434,6 @@ async def websocket_handler(ws: WebSocket):
             pending_transcript = None
             pending_is_final = False
 
-        # basic sanity
         if not text or len(text) < 1:
             return
         if sum(1 for w in text.split() if w.strip()) < MIN_WORDS_TO_PROCESS:
@@ -443,7 +442,6 @@ async def websocket_handler(ws: WebSocket):
 
         log.info(f"Processing transcript (debounced): {text}")
 
-        # cancel any running stream / tts to prioritize this new utterance
         if current_stream_task and not current_stream_task.done():
             try:
                 current_stream_task.cancel()
@@ -457,12 +455,10 @@ async def websocket_handler(ws: WebSocket):
             except Exception as e:
                 log.error(f"Error cancelling current_tts_task: {e}")
 
-        # start a new LLM streaming task (background)
         current_stream_task = asyncio.create_task(run_llm_stream_and_tts(text))
 
     async def schedule_debounce_and_process():
         nonlocal debounce_task
-        # cancel previous debounce
         if debounce_task and not debounce_task.done():
             debounce_task.cancel()
         async def _wait_and_run():
@@ -476,7 +472,7 @@ async def websocket_handler(ws: WebSocket):
         debounce_task = asyncio.create_task(_wait_and_run())
 
     async def transcript_processor():
-        nonlocal pending_transcript, pending_is_final
+        nonlocal pending_transcript, pending_is_final, recent_msgs
         try:
             while True:
                 try:
@@ -489,24 +485,18 @@ async def websocket_handler(ws: WebSocket):
 
                 log.info(f"DG transcript (final={is_final}): {transcript}")
 
-                # quick filter
                 if len(transcript.strip()) < 1 or not any(ch.isalpha() for ch in transcript):
                     continue
 
-                # normalization + dedupe
                 norm = _normalize(transcript)
                 now = time.time()
-                nonlocal_recent = [(m, t) for (m, t) in recent_msgs if now - t < 2]
-                # use existing recent_msgs array
-                recent_msgs[:] = nonlocal_recent
+                recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
                 if any(_is_similar(m, norm) for (m, t) in recent_msgs):
                     log.info("Duplicate/very-similar transcript — ignoring")
                     continue
                 recent_msgs.append((norm, now))
 
-                # If final, process immediately
                 if is_final:
-                    # set pending and cancel debounce to process right away
                     async with debounce_lock:
                         pending_transcript = transcript
                         pending_is_final = True
@@ -515,9 +505,7 @@ async def websocket_handler(ws: WebSocket):
                     await process_pending_transcript()
                     continue
 
-                # Not final -> update pending_transcript and schedule debounce
                 async with debounce_lock:
-                    # append or replace with latest partial (we keep latest partial)
                     pending_transcript = transcript
                     pending_is_final = False
                 await schedule_debounce_and_process()
@@ -592,11 +580,10 @@ async def websocket_handler(ws: WebSocket):
                                 log.info("Requested cancellation of current_tts_task")
                             except Exception as e:
                                 log.error(f"Error cancelling current_tts_task: {e}")
-                        # clear pending transcript so we don't resume processing an old partial
+                        # clear pending transcript and cancel debounce safely
                         async with debounce_lock:
-                            nonlocal pending_transcript  # type: ignore
                             pending_transcript = None
-                        # also cancel debounce
+                            pending_is_final = False
                         if debounce_task and not debounce_task.done():
                             debounce_task.cancel()
                         continue
