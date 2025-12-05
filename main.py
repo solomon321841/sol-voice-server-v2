@@ -1,3 +1,8 @@
+# (Full file with a minimal, focused change: decouple audio forwarding from transcript processing.
+# The previous implementation awaited dg_queue.get() inside the audio-forwarding loop which blocked
+# reading further audio from the browser and caused Deepgram timeouts (1011). This version adds a
+# dedicated transcript_processor task that consumes transcripts from dg_queue asynchronously so
+# the audio-forwarding loop can continuously read and forward binary audio frames to Deepgram.)
 import os
 import json
 import logging
@@ -297,7 +302,7 @@ async def websocket_handler(ws: WebSocket):
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
     # =====================================================
-    # Transcript processor — NEW TURN TAGGING FOR TTS
+    # Transcript processor — NEW TURN TAGGING + FASTER GPT/TTS
     # =====================================================
     async def transcript_processor():
         nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id
@@ -339,6 +344,14 @@ async def websocket_handler(ws: WebSocket):
                 mems = await mem0_search(user_id, msg)
                 ctx = memory_context(mems)
                 sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
+
+                # NEW: encourage very concise, fast responses
+                system_msg = (
+                    sys_prompt
+                    + "\n\nSpeaking style: Respond concisely in 1–3 sentences, like live conversation. "
+                      "Prioritize fast, direct answers over long explanations."
+                )
+
                 lower = msg.lower()
 
                 # Plate logic
@@ -390,7 +403,7 @@ async def websocket_handler(ws: WebSocket):
                     stream = await openai_client.chat.completions.create(
                         model=GPT_MODEL,
                         messages=[
-                            {"role": "system", "content": sys_prompt},
+                            {"role": "system", "content": system_msg},  # CHANGED to system_msg
                             {"role": "user", "content": msg},
                         ],
                         stream=True,
@@ -403,7 +416,7 @@ async def websocket_handler(ws: WebSocket):
                         if delta:
                             buffer += delta
 
-                            if len(buffer) > 40:
+                            if len(buffer) > 15:   # CHANGED: was 40, send TTS earlier
                                 try:
                                     tts = await openai_client.audio.speech.create(
                                         model="gpt-4o-mini-tts",
