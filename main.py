@@ -1,8 +1,3 @@
-# (Full file with a minimal, focused change: decouple audio forwarding from transcript processing.
-# The previous implementation awaited dg_queue.get() inside the audio-forwarding loop which blocked
-# reading further audio from the browser and caused Deepgram timeouts (1011). This version adds a
-# dedicated transcript_processor task that consumes transcripts from dg_queue asynchronously so
-# the audio-forwarding loop can continuously read and forward binary audio frames to Deepgram.)
 import os
 import json
 import logging
@@ -162,6 +157,10 @@ async def websocket_handler(ws: WebSocket):
     recent_msgs = []
     processed_messages = set()
 
+    # TURN COUNTER FOR THIS CONNECTION (NEW)
+    # Each accepted transcript increments turn_id. TTS for that transcript is tagged.
+    turn_id = 0
+
     calendar_kw = ["calendar", "meeting", "schedule", "appointment"]
     plate_kw = ["plate", "add", "to-do", "task", "notion", "list"]
 
@@ -185,13 +184,15 @@ async def websocket_handler(ws: WebSocket):
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
 
-    # GREETING TTS (unchanged)
+    # GREETING TTS (unchanged, but we tag as turn_id 0)
     try:
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
             voice="alloy",
             input=greet
         )
+        # Announce TTS chunk metadata
+        await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": turn_id}))
         await ws.send_bytes(await tts_greet.aread())
     except Exception as e:
         log.error(f"❌ Greeting TTS error: {e}")
@@ -296,11 +297,10 @@ async def websocket_handler(ws: WebSocket):
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
     # =====================================================
-    # Transcript processor (NEW) — consumes dg_queue asynchronously so
-    # audio-forwarding loop is never blocked waiting for transcripts.
+    # Transcript processor — NEW TURN TAGGING FOR TTS
     # =====================================================
     async def transcript_processor():
-        nonlocal recent_msgs, processed_messages, prompt, last_audio_time
+        nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id
         try:
             while True:
                 try:
@@ -325,6 +325,16 @@ async def websocket_handler(ws: WebSocket):
                     continue
                 recent_msgs.append((norm, now))
 
+                # NEW TURN: each accepted, de-duplicated transcript is a new turn
+                turn_id += 1
+                current_turn = turn_id  # capture for closures
+
+                # Optional: tell client a new turn started
+                try:
+                    await ws.send_text(json.dumps({"type": "set_turn", "turn_id": current_turn}))
+                except Exception:
+                    pass
+
                 # Use memory & notion context as before
                 mems = await mem0_search(user_id, msg)
                 ctx = memory_context(mems)
@@ -345,6 +355,11 @@ async def websocket_handler(ws: WebSocket):
                             voice="alloy",
                             input=reply
                         )
+                        # Tag this audio as belonging to current_turn
+                        try:
+                            await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
+                        except Exception:
+                            pass
                         await ws.send_bytes(await tts.aread())
                     except Exception as e:
                         log.error(f"❌ TTS plate error: {e}")
@@ -360,6 +375,10 @@ async def websocket_handler(ws: WebSocket):
                             voice="alloy",
                             input=reply
                         )
+                        try:
+                            await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
+                        except Exception:
+                            pass
                         await ws.send_bytes(await tts.aread())
                     except Exception as e:
                         log.error(f"❌ TTS calendar error: {e}")
@@ -391,6 +410,11 @@ async def websocket_handler(ws: WebSocket):
                                         voice="alloy",
                                         input=buffer
                                     )
+                                    # Tag the chunk with this turn id
+                                    try:
+                                        await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
+                                    except Exception:
+                                        pass
                                     await ws.send_bytes(await tts.aread())
                                 except Exception as e:
                                     log.error(f"❌ TTS stream-chunk error: {e}")
@@ -403,6 +427,10 @@ async def websocket_handler(ws: WebSocket):
                                 voice="alloy",
                                 input=buffer
                             )
+                            try:
+                                await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
+                            except Exception:
+                                pass
                             await ws.send_bytes(await tts.aread())
                         except Exception as e:
                             log.error(f"❌ TTS final-chunk error: {e}")
