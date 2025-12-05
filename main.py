@@ -142,6 +142,10 @@ async def websocket_handler(ws: WebSocket):
   await ws.accept()
   user_id = "solomon_roth"
 
+  # Connection state tracking
+  ws_connected = True
+  dg_connected = False
+
   # Conversation history
   chat_history = []
 
@@ -163,10 +167,12 @@ async def websocket_handler(ws: WebSocket):
           voice="alloy",
           input=greet
       )
-      await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": 0}))
-      await ws.send_bytes(await tts_greet.aread())
+      if ws_connected:
+          await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": 0}))
+          await ws.send_bytes(await tts_greet.aread())
   except Exception as e:
       log.error(f"❌ Greeting TTS error: {e}")
+      ws_connected = False
 
   # =====================================================
   # Connect to Deepgram with auto-ping
@@ -192,15 +198,18 @@ async def websocket_handler(ws: WebSocket):
           max_size=None,
           close_timeout=5
       )
+      dg_connected = True
       log.info("✅ Connected to Deepgram")
   except Exception as e:
       log.error(f"❌ Failed to connect to Deepgram WS: {e}")
+      ws_connected = False
       await ws.close(code=1011, reason="Failed to connect to Deepgram")
       return
 
   dg_queue = Queue()
 
   async def deepgram_listener_task():
+      nonlocal dg_connected, ws_connected
       try:
           async for raw in dg_ws:
               try:
@@ -240,27 +249,32 @@ async def websocket_handler(ws: WebSocket):
       except Exception as e:
           log.error(f"❌ DG listener fatal unexpected error: {e}")
       finally:
-          try:
-              await ws.close(code=1011, reason="Deepgram connection closed")
-          except Exception:
-              pass
+          dg_connected = False
+          # Only close the browser websocket if it's still connected
+          if ws_connected:
+              try:
+                  ws_connected = False
+                  await ws.close(code=1011, reason="Deepgram connection closed")
+              except Exception as close_err:
+                  log.error(f"❌ Error closing browser websocket: {close_err}")
 
   asyncio.create_task(deepgram_listener_task())
 
   last_audio_time = time.time()
 
   async def dg_keepalive_task():
-      nonlocal last_audio_time
+      nonlocal last_audio_time, dg_connected
       try:
-          while True:
+          while dg_connected:
               await asyncio.sleep(1.2)
               if time.time() - last_audio_time > 1.5:
                   try:
                       silence = (b"\x00\x00") * 4800
                       await dg_ws.send(silence)
-                      log.info("📨 Sent DG keepalive silence")
+                      log.debug("📨 Sent DG keepalive silence")
                   except Exception as e:
                       log.error(f"❌ Error sending keepalive to Deepgram: {e}")
+                      dg_connected = False
                       break
       except asyncio.CancelledError:
           return
@@ -271,7 +285,7 @@ async def websocket_handler(ws: WebSocket):
   # Transcript processor — interruption + context
   # =====================================================
   async def transcript_processor():
-      nonlocal prompt, last_audio_time, turn_id, current_active_turn_id, chat_history
+      nonlocal prompt, last_audio_time, turn_id, current_active_turn_id, chat_history, ws_connected
       try:
           while True:
               try:
@@ -284,9 +298,10 @@ async def websocket_handler(ws: WebSocket):
 
               log.info(f"📝 DG transcript (candidate): '{transcript}'")
 
-              # Very relaxed: require at least 1 letter
-              if not any(ch.isalpha() for ch in transcript):
-                  log.info("⏭ Ignoring transcript with no alphabetic chars")
+              # Require at least 2 words to reduce false positives from noise
+              words = transcript.split()
+              if len(words) < 2:
+                  log.info(f"⏭ Ignoring short transcript (< 2 words): '{transcript}'")
                   continue
 
               msg = transcript
@@ -327,6 +342,7 @@ async def websocket_handler(ws: WebSocket):
                   assistant_full_text = ""
 
                   async for chunk in stream:
+                      # Check if this turn was interrupted
                       if current_turn != current_active_turn_id:
                           log.info(f"🔁 CANCEL STREAM turn={current_turn}, active={current_active_turn_id}")
                           break
@@ -339,6 +355,7 @@ async def websocket_handler(ws: WebSocket):
                       buffer += delta
 
                       if len(buffer) > CHUNK_CHAR_THRESHOLD:
+                          # Double-check turn is still active before TTS
                           if current_turn != current_active_turn_id:
                               log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
                               break
@@ -350,19 +367,28 @@ async def websocket_handler(ws: WebSocket):
                                   voice="alloy",
                                   input=buffer
                               )
+                              # Final check before sending
                               if current_turn != current_active_turn_id:
                                   log.info(f"🔁 Turn {current_turn} cancelled after TTS chunk generation.")
                                   break
-                              try:
-                                  await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
-                              except Exception:
-                                  pass
-                              await ws.send_bytes(await tts.aread())
-                              log.info(f"🎙️ TTS CHUNK SENT turn={current_turn}")
+                              # Check websocket is still connected before sending
+                              if ws_connected:
+                                  try:
+                                      await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
+                                      await ws.send_bytes(await tts.aread())
+                                      log.info(f"🎙️ TTS CHUNK SENT turn={current_turn}")
+                                  except Exception as send_err:
+                                      log.error(f"❌ Error sending TTS chunk: {send_err}")
+                                      ws_connected = False
+                                      break
+                              else:
+                                  log.info(f"⏭ WebSocket closed, skipping TTS for turn {current_turn}")
+                                  break
                           except Exception as e:
                               log.error(f"❌ TTS stream-chunk error: {e}")
                           buffer = ""
 
+                  # Send final buffer if turn is still active
                   if buffer.strip() and current_turn == current_active_turn_id:
                       try:
                           log.info(f"🎙️ TTS FINAL START turn={current_turn}, len={len(buffer.strip())}")
@@ -371,16 +397,18 @@ async def websocket_handler(ws: WebSocket):
                               voice="alloy",
                               input=buffer
                           )
-                          if current_turn == current_active_turn_id:
+                          if current_turn == current_active_turn_id and ws_connected:
                               try:
                                   await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
-                              except Exception:
-                                  pass
-                              await ws.send_bytes(await tts.aread())
-                              log.info(f"🎙️ TTS FINAL SENT turn={current_turn}")
+                                  await ws.send_bytes(await tts.aread())
+                                  log.info(f"🎙️ TTS FINAL SENT turn={current_turn}")
+                              except Exception as send_err:
+                                  log.error(f"❌ Error sending final TTS: {send_err}")
+                                  ws_connected = False
                       except Exception as e:
                           log.error(f"❌ TTS final-chunk error: {e}")
 
+                  # Only append to chat history if turn completed successfully
                   if assistant_full_text.strip() and current_turn == current_active_turn_id:
                       chat_history.append({"role": "assistant", "content": assistant_full_text.strip()})
                       log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)})")
@@ -399,44 +427,47 @@ async def websocket_handler(ws: WebSocket):
   # MAIN LOOP — browser audio -> Deepgram
   # =====================================================
   try:
-      while True:
+      while ws_connected and dg_connected:
           try:
               audio_bytes = await ws.receive_bytes()
           except WebSocketDisconnect:
-              log.info("Browser websocket disconnected")
+              log.info("🔌 Browser websocket disconnected")
+              ws_connected = False
               break
           except Exception as e:
-              log.error(f"WebSocket receive error: {e}")
-              await asyncio.sleep(0.05)
-              continue
+              log.error(f"❌ WebSocket receive error: {e}")
+              ws_connected = False
+              break
 
           if not audio_bytes:
               continue
 
+          # Ensure even byte count for 16-bit PCM
           if len(audio_bytes) % 2 != 0:
               audio_bytes = audio_bytes + b"\x00"
 
           last_audio_time = time.time()
 
-          import struct
-          try:
-              if len(audio_bytes) >= 20:
-                  samples = struct.unpack("<10h", audio_bytes[:20])
-                  log.info(f"PCM samples[0:10] = {list(samples)}")
-          except Exception as e:
-              log.error(f"sample unpack error: {e}")
-
-          log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
+          # Log audio reception without verbose PCM sample data
+          log.debug(f"📡 PCM audio received — {len(audio_bytes)} bytes")
 
           try:
               await dg_ws.send(audio_bytes)
           except Exception as e:
               log.error(f"❌ Error sending audio to Deepgram WS: {e}")
+              dg_connected = False
               break
 
   except WebSocketDisconnect:
-      pass
+      ws_connected = False
+      log.info("🔌 Browser websocket disconnected (outer)")
+  except Exception as outer_err:
+      log.error(f"❌ Main loop error: {outer_err}")
+      ws_connected = False
   finally:
+      log.info("🧹 Cleaning up websocket session...")
+      ws_connected = False
+      dg_connected = False
       try:
           keepalive_task.cancel()
       except:
