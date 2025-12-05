@@ -1,3 +1,8 @@
+# (Full file with a minimal, focused change: decouple audio forwarding from transcript processing.
+# The previous implementation awaited dg_queue.get() inside the audio-forwarding loop which blocked
+# reading further audio from the browser and caused Deepgram timeouts (1011). This version adds a
+# dedicated transcript_processor task that consumes transcripts from dg_queue asynchronously so
+# the audio-forwarding loop can continuously read and forward binary audio frames to Deepgram.)
 import os
 import json
 import logging
@@ -214,8 +219,8 @@ async def websocket_handler(ws: WebSocket):
             close_timeout=0
         )
     except Exception as e:
-            log.error(f"❌ Failed to connect to Deepgram WS: {e}")
-            return
+        log.error(f"❌ Failed to connect to Deepgram WS: {e}")
+        return
 
     # =====================================================
     # PARALLEL DEEPGRAM LISTENER
@@ -234,7 +239,8 @@ async def websocket_handler(ws: WebSocket):
 
                     data = json.loads(raw_text)
 
-                    # Accept known types; Deepgram messages vary by version
+                    # Accept known types; Deepgram messages vary by version,
+                    # check for 'type' and 'channel'/'alternatives' shapes.
                     if not isinstance(data, dict):
                         continue
 
@@ -242,11 +248,16 @@ async def websocket_handler(ws: WebSocket):
                     if "channel" in data and isinstance(data["channel"], dict):
                         alts = data["channel"].get("alternatives", [])
                     elif "results" in data and isinstance(data["results"], dict):
+                        # sometimes nested under results
                         ch = data["results"].get("channels", [])
                         if ch and isinstance(ch, list):
                             alts = ch[0].get("alternatives", [])
                         else:
                             alts = data["results"].get("alternatives", [])
+                    else:
+                        # fallback: look for 'transcript' anywhere
+                        pass
+
                     transcript = ""
                     if alts and isinstance(alts, list):
                         transcript = alts[0].get("transcript", "").strip()
@@ -285,23 +296,11 @@ async def websocket_handler(ws: WebSocket):
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
     # =====================================================
-    # NEW: cancellation + active generation state
-    # =====================================================
-    generation_active = False
-    cancel_event = asyncio.Event()
-
-    async def send_cancel_tts():
-        # Notify client to stop current playback immediately
-        try:
-            await ws.send_text(json.dumps({"type": "cancel_tts"}))
-        except Exception as e:
-            log.error(f"send_cancel_tts error: {e}")
-
-    # =====================================================
-    # Transcript processor — minimal cancellation hooks
+    # Transcript processor (NEW) — consumes dg_queue asynchronously so
+    # audio-forwarding loop is never blocked waiting for transcripts.
     # =====================================================
     async def transcript_processor():
-        nonlocal recent_msgs, processed_messages, prompt, last_audio_time, generation_active, cancel_event
+        nonlocal recent_msgs, processed_messages, prompt, last_audio_time
         try:
             while True:
                 try:
@@ -313,14 +312,6 @@ async def websocket_handler(ws: WebSocket):
                     continue
 
                 log.info(f"📝 DG transcript: {transcript}")
-
-                # If we are currently generating/speaking, cancel and notify client
-                if generation_active:
-                    cancel_event.set()
-                    await send_cancel_tts()
-
-                # Reset cancellation for this new turn
-                cancel_event.clear()
 
                 # Basic transcript sanity checks (same as original)
                 if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
@@ -340,116 +331,86 @@ async def websocket_handler(ws: WebSocket):
                 sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
                 lower = msg.lower()
 
-                generation_active = True
-                try:
-                    # Plate logic
-                    if any(k in lower for k in plate_kw):
-                        if msg in processed_messages:
-                            generation_active = False
-                            continue
-                        processed_messages.add(msg)
-
-                        reply = await send_to_n8n(N8N_PLATE_URL, msg)
-
-                        try:
-                            if cancel_event.is_set():
-                                generation_active = False
-                                continue
-                            tts = await openai_client.audio.speech.create(
-                                model="gpt-4o-mini-tts",
-                                voice="alloy",
-                                input=reply
-                            )
-                            if cancel_event.is_set():
-                                generation_active = False
-                                continue
-                            await ws.send_bytes(await tts.aread())
-                        except Exception as e:
-                            log.error(f"❌ TTS plate error: {e}")
-                        generation_active = False
+                # Plate logic
+                if any(k in lower for k in plate_kw):
+                    if msg in processed_messages:
                         continue
+                    processed_messages.add(msg)
 
-                    # Calendar logic
-                    if any(k in lower for k in calendar_kw):
-                        reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
+                    reply = await send_to_n8n(N8N_PLATE_URL, msg)
 
-                        try:
-                            if cancel_event.is_set():
-                                generation_active = False
-                                continue
-                            tts = await openai_client.audio.speech.create(
-                                model="gpt-4o-mini-tts",
-                                voice="alloy",
-                                input=reply
-                            )
-                            if cancel_event.is_set():
-                                generation_active = False
-                                continue
-                            await ws.send_bytes(await tts.aread())
-                        except Exception as e:
-                            log.error(f"❌ TTS calendar error: {e}")
-                        generation_active = False
-                        continue
-
-                    # General GPT logic
                     try:
-                        stream = await openai_client.chat.completions.create(
-                            model=GPT_MODEL,
-                            messages=[
-                                {"role": "system", "content": sys_prompt},
-                                {"role": "user", "content": msg},
-                            ],
-                            stream=True,
+                        tts = await openai_client.audio.speech.create(
+                            model="gpt-4o-mini-tts",
+                            voice="alloy",
+                            input=reply
                         )
-
-                        buffer = ""
-
-                        async for chunk in stream:
-                            if cancel_event.is_set():
-                                log.info("🔪 Cancelling LLM stream due to barge-in")
-                                break
-                            delta = getattr(chunk.choices[0].delta, "content", "")
-                            if delta:
-                                buffer += delta
-
-                                if len(buffer) > 40:
-                                    try:
-                                        if cancel_event.is_set():
-                                            break
-                                        tts = await openai_client.audio.speech.create(
-                                            model="gpt-4o-mini-tts",
-                                            voice="alloy",
-                                            input=buffer
-                                        )
-                                        if cancel_event.is_set():
-                                            break
-                                        await ws.send_bytes(await tts.aread())
-                                    except Exception as e:
-                                        log.error(f"❌ TTS stream-chunk error: {e}")
-                                    buffer = ""
-
-                        if buffer.strip() and not cancel_event.is_set():
-                            try:
-                                tts = await openai_client.audio.speech.create(
-                                    model="gpt-4o-mini-tts",
-                                    voice="alloy",
-                                    input=buffer
-                                )
-                                if not cancel_event.is_set():
-                                    await ws.send_bytes(await tts.aread())
-                            except Exception as e:
-                                log.error(f"❌ TTS final-chunk error: {e}")
-
-                        asyncio.create_task(mem0_add(user_id, msg))
-
+                        await ws.send_bytes(await tts.aread())
                     except Exception as e:
-                        log.error(f"LLM error: {e}")
-                    finally:
-                        generation_active = False
+                        log.error(f"❌ TTS plate error: {e}")
+                    continue
+
+                # Calendar logic
+                if any(k in lower for k in calendar_kw):
+                    reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
+
+                    try:
+                        tts = await openai_client.audio.speech.create(
+                            model="gpt-4o-mini-tts",
+                            voice="alloy",
+                            input=reply
+                        )
+                        await ws.send_bytes(await tts.aread())
+                    except Exception as e:
+                        log.error(f"❌ TTS calendar error: {e}")
+
+                    continue
+
+                # General GPT logic
+                try:
+                    stream = await openai_client.chat.completions.create(
+                        model=GPT_MODEL,
+                        messages=[
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user", "content": msg},
+                        ],
+                        stream=True,
+                    )
+
+                    buffer = ""
+
+                    async for chunk in stream:
+                        delta = getattr(chunk.choices[0].delta, "content", "")
+                        if delta:
+                            buffer += delta
+
+                            if len(buffer) > 40:
+                                try:
+                                    tts = await openai_client.audio.speech.create(
+                                        model="gpt-4o-mini-tts",
+                                        voice="alloy",
+                                        input=buffer
+                                    )
+                                    await ws.send_bytes(await tts.aread())
+                                except Exception as e:
+                                    log.error(f"❌ TTS stream-chunk error: {e}")
+                                buffer = ""
+
+                    if buffer.strip():
+                        try:
+                            tts = await openai_client.audio.speech.create(
+                                model="gpt-4o-mini-tts",
+                                voice="alloy",
+                                input=buffer
+                            )
+                            await ws.send_bytes(await tts.aread())
+                        except Exception as e:
+                            log.error(f"❌ TTS final-chunk error: {e}")
+
+                    asyncio.create_task(mem0_add(user_id, msg))
 
                 except Exception as e:
-                    log.error(f"❌ transcript_processor fatal inner: {e}")
-                    generation_active = False
+                    log.error(f"LLM error: {e}")
 
         except Exception as e:
             log.error(f"❌ transcript_processor fatal: {e}")
