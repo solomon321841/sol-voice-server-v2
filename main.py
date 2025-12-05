@@ -1,8 +1,6 @@
-# (Full file with a minimal, focused change: decouple audio forwarding from transcript processing.
-# The previous implementation awaited dg_queue.get() inside the audio-forwarding loop which blocked
-# reading further audio from the browser and caused Deepgram timeouts (1011). This version adds a
-# dedicated transcript_processor task that consumes transcripts from dg_queue asynchronously so
-# the audio-forwarding loop can continuously read and forward binary audio frames to Deepgram.)
+# (Full file with a minimal, focused change: add barge-in cancellation and a control listener.
+# The transcript processing now respects a cancel_event to stop LLM/TTS mid-stream when "barge_in" arrives.
+# Also added a concurrent task to read text control messages from the browser while the main loop forwards audio bytes.)
 import os
 import json
 import logging
@@ -239,8 +237,6 @@ async def websocket_handler(ws: WebSocket):
 
                     data = json.loads(raw_text)
 
-                    # Accept known types; Deepgram messages vary by version,
-                    # check for 'type' and 'channel'/'alternatives' shapes.
                     if not isinstance(data, dict):
                         continue
 
@@ -248,14 +244,12 @@ async def websocket_handler(ws: WebSocket):
                     if "channel" in data and isinstance(data["channel"], dict):
                         alts = data["channel"].get("alternatives", [])
                     elif "results" in data and isinstance(data["results"], dict):
-                        # sometimes nested under results
                         ch = data["results"].get("channels", [])
                         if ch and isinstance(ch, list):
                             alts = ch[0].get("alternatives", [])
                         else:
                             alts = data["results"].get("alternatives", [])
                     else:
-                        # fallback: look for 'transcript' anywhere
                         pass
 
                     transcript = ""
@@ -275,16 +269,13 @@ async def websocket_handler(ws: WebSocket):
     # Keep last audio timestamp for backend keepalive
     last_audio_time = time.time()
 
-    # backend keepalive: send silence to Deepgram when no audio has been forwarded for some time
     async def dg_keepalive_task():
         nonlocal last_audio_time
         try:
             while True:
                 await asyncio.sleep(1.2)
-                # if no real audio for >1.5s send short silence
                 if time.time() - last_audio_time > 1.5:
                     try:
-                        # 100ms silence at 48kHz mono = 4800 samples -> 9600 bytes
                         silence = (b'\x00\x00') * 4800
                         await dg_ws.send(silence)
                     except Exception as e:
@@ -296,11 +287,37 @@ async def websocket_handler(ws: WebSocket):
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
     # =====================================================
-    # Transcript processor (NEW) — consumes dg_queue asynchronously so
-    # audio-forwarding loop is never blocked waiting for transcripts.
+    # Cancellation state (NEW)
+    # =====================================================
+    cancel_event = asyncio.Event()
+
+    async def control_listener():
+        # Listen for text control frames from the browser (e.g., {"type":"barge_in"})
+        try:
+          while True:
+            msg = await ws.receive_text()
+            try:
+                data = json.loads(msg)
+            except Exception:
+                data = {}
+            t = data.get("type") or ""
+            if t == "barge_in":
+                log.info("🛑 Barge-in received from client. Cancelling current generation/TTS.")
+                cancel_event.set()
+            else:
+                log.info(f"WS text message ignored: {data}")
+        except WebSocketDisconnect:
+            log.info("Browser websocket (text) disconnected")
+        except Exception as e:
+            log.error(f"control_listener error: {e}")
+
+    control_task = asyncio.create_task(control_listener())
+
+    # =====================================================
+    # Transcript processor — respects cancel_event
     # =====================================================
     async def transcript_processor():
-        nonlocal recent_msgs, processed_messages, prompt, last_audio_time
+        nonlocal recent_msgs, processed_messages, prompt, last_audio_time, cancel_event
         try:
             while True:
                 try:
@@ -313,7 +330,10 @@ async def websocket_handler(ws: WebSocket):
 
                 log.info(f"📝 DG transcript: {transcript}")
 
-                # Basic transcript sanity checks (same as original)
+                # Reset cancellation at the start of a new user utterance
+                cancel_event.clear()
+
+                # Basic transcript sanity checks
                 if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
                     continue
 
@@ -340,11 +360,15 @@ async def websocket_handler(ws: WebSocket):
                     reply = await send_to_n8n(N8N_PLATE_URL, msg)
 
                     try:
+                        if cancel_event.is_set():
+                            continue
                         tts = await openai_client.audio.speech.create(
                             model="gpt-4o-mini-tts",
                             voice="alloy",
                             input=reply
                         )
+                        if cancel_event.is_set():
+                            continue
                         await ws.send_bytes(await tts.aread())
                     except Exception as e:
                         log.error(f"❌ TTS plate error: {e}")
@@ -355,18 +379,22 @@ async def websocket_handler(ws: WebSocket):
                     reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
 
                     try:
+                        if cancel_event.is_set():
+                            continue
                         tts = await openai_client.audio.speech.create(
                             model="gpt-4o-mini-tts",
                             voice="alloy",
                             input=reply
                         )
+                        if cancel_event.is_set():
+                            continue
                         await ws.send_bytes(await tts.aread())
                     except Exception as e:
                         log.error(f"❌ TTS calendar error: {e}")
 
                     continue
 
-                # General GPT logic
+                # General GPT logic with streaming + cancellation
                 try:
                     stream = await openai_client.chat.completions.create(
                         model=GPT_MODEL,
@@ -380,30 +408,41 @@ async def websocket_handler(ws: WebSocket):
                     buffer = ""
 
                     async for chunk in stream:
+                        if cancel_event.is_set():
+                            log.info("🔪 Cancelling LLM stream due to barge-in")
+                            # Break out of the token loop; no more TTS chunks
+                            break
+
                         delta = getattr(chunk.choices[0].delta, "content", "")
                         if delta:
                             buffer += delta
 
                             if len(buffer) > 40:
                                 try:
+                                    if cancel_event.is_set():
+                                        break
                                     tts = await openai_client.audio.speech.create(
                                         model="gpt-4o-mini-tts",
                                         voice="alloy",
                                         input=buffer
                                     )
+                                    if cancel_event.is_set():
+                                        break
                                     await ws.send_bytes(await tts.aread())
                                 except Exception as e:
                                     log.error(f"❌ TTS stream-chunk error: {e}")
                                 buffer = ""
 
-                    if buffer.strip():
+                    # Send any trailing buffer if not cancelled
+                    if buffer.strip() and not cancel_event.is_set():
                         try:
                             tts = await openai_client.audio.speech.create(
                                 model="gpt-4o-mini-tts",
                                 voice="alloy",
                                 input=buffer
                             )
-                            await ws.send_bytes(await tts.aread())
+                            if not cancel_event.is_set():
+                                await ws.send_bytes(await tts.aread())
                         except Exception as e:
                             log.error(f"❌ TTS final-chunk error: {e}")
 
@@ -423,7 +462,6 @@ async def websocket_handler(ws: WebSocket):
     try:
         while True:
             try:
-                # Use receive_bytes to ensure we get binary payloads quickly
                 audio_bytes = await ws.receive_bytes()
             except WebSocketDisconnect:
                 log.info("Browser websocket disconnected")
@@ -469,10 +507,7 @@ async def websocket_handler(ws: WebSocket):
                 await dg_ws.send(audio_bytes)
             except Exception as e:
                 log.error(f"❌ Error sending audio to Deepgram WS: {e}")
-                # continue forwarding future frames; keepalive_task will try to maintain DG session
                 continue
-
-            # Do NOT wait for transcript here; transcript_task will consume dg_queue independently
 
     except WebSocketDisconnect:
         pass
@@ -484,6 +519,10 @@ async def websocket_handler(ws: WebSocket):
             pass
         try:
             transcript_task.cancel()
+        except:
+            pass
+        try:
+            control_task.cancel()
         except:
             pass
         try:
