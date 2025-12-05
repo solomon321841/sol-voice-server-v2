@@ -3,7 +3,6 @@ import json
 import logging
 import asyncio
 import time
-import random
 import string
 from typing import List, Dict
 from dotenv import load_dotenv
@@ -13,7 +12,6 @@ from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from openai import AsyncOpenAI
-import tempfile
 import websockets
 from asyncio import Queue
 
@@ -162,8 +160,7 @@ async def websocket_handler(ws: WebSocket):
     recent_msgs = []
     processed_messages = set()
 
-    # Conversation history for this connection (for GPT context)
-    # We only store user/assistant turns, not system.
+    # Conversation history for GPT context
     chat_history = []
 
     # Turn tracking
@@ -176,25 +173,12 @@ async def websocket_handler(ws: WebSocket):
     plate_add_kw = ["add", "put", "create", "new", "include"]
     plate_check_kw = ["what", "show", "see", "check", "read"]
 
-    add_phrases = [
-        "Of course boss. Doing that now.",
-        "Gotcha. Give me one sec.",
-        "Of course. Adding that now.",
-        "Okay. Putting that on your plate.",
-        "Not a problem. I’ll be right back.",
-    ]
-    check_phrases = [
-        "Let’s see what’s on your plate...",
-        "One moment, checking that for you...",
-        "Alright, here’s what you’ve got...",
-        "Give me a sec, pulling that up...",
-    ]
-
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
 
-    # GREETING (not tracked in chat_history; it's just a hello)
+    # GREETING
     try:
+        log.info("👋 Sending greeting TTS")
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
             voice="alloy",
@@ -220,6 +204,7 @@ async def websocket_handler(ws: WebSocket):
     )
 
     try:
+        log.info("🌐 Connecting to Deepgram...")
         dg_ws = await websockets.connect(
             dg_url,
             additional_headers=[("Authorization", f"Token {DEEPGRAM_API_KEY}")],
@@ -227,6 +212,7 @@ async def websocket_handler(ws: WebSocket):
             max_size=None,
             close_timeout=0
         )
+        log.info("✅ Connected to Deepgram")
     except Exception as e:
         log.error(f"❌ Failed to connect to Deepgram WS: {e}")
         return
@@ -261,6 +247,7 @@ async def websocket_handler(ws: WebSocket):
                         transcript = alts[0].get("transcript", "").strip()
 
                     if transcript:
+                        log.info(f"🧠 Deepgram partial/final transcript: {transcript}")
                         await dg_queue.put(transcript)
 
                 except Exception as e:
@@ -281,6 +268,7 @@ async def websocket_handler(ws: WebSocket):
                     try:
                         silence = (b"\x00\x00") * 4800
                         await dg_ws.send(silence)
+                        log.info("📨 Sent DG keepalive silence")
                     except Exception as e:
                         log.error(f"❌ Error sending keepalive to Deepgram: {e}")
                         break
@@ -304,9 +292,10 @@ async def websocket_handler(ws: WebSocket):
                 if not transcript:
                     continue
 
-                log.info(f"📝 DG transcript: {transcript}")
+                log.info(f"📝 DG transcript (candidate): '{transcript}'")
 
                 if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
+                    log.info("⏭ Ignoring very short / non-alpha transcript")
                     continue
 
                 msg = transcript
@@ -314,6 +303,7 @@ async def websocket_handler(ws: WebSocket):
                 now = time.time()
                 recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
                 if any(_is_similar(m, norm) for (m, t) in recent_msgs):
+                    log.info(f"⏭ Skipping near-duplicate transcript: '{msg}'")
                     continue
                 recent_msgs.append((norm, now))
 
@@ -324,6 +314,7 @@ async def websocket_handler(ws: WebSocket):
                 turn_id += 1
                 current_turn = turn_id
                 current_active_turn_id = current_turn  # supersede older streams
+                log.info(f"🎯 NEW TURN {current_turn}: '{msg}' (history len={len(chat_history)})")
 
                 # Context from mem0 + notion
                 mems = await mem0_search(user_id, msg)
@@ -337,63 +328,71 @@ async def websocket_handler(ws: WebSocket):
 
                 lower = msg.lower()
 
-                # Plate logic (kept simple, no history yet)
+                # Plate logic
                 if any(k in lower for k in plate_kw):
                     if msg in processed_messages:
+                        log.info(f"⏭ Plate msg already processed: '{msg}'")
                         continue
                     processed_messages.add(msg)
 
                     reply = await send_to_n8n(N8N_PLATE_URL, msg)
 
                     if current_turn != current_active_turn_id:
+                        log.info(f"🔁 Plate turn {current_turn} abandoned (active={current_active_turn_id})")
                         continue
 
                     try:
+                        log.info(f"🎙️ Plate TTS START turn={current_turn}")
                         tts = await openai_client.audio.speech.create(
                             model="gpt-4o-mini-tts",
                             voice="alloy",
                             input=reply
                         )
                         if current_turn != current_active_turn_id:
+                            log.info(f"🔁 Plate turn {current_turn} abandoned after TTS (active={current_active_turn_id})")
                             continue
                         try:
                             await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
                         except Exception:
                             pass
                         await ws.send_bytes(await tts.aread())
+                        log.info(f"🎙️ Plate TTS SENT turn={current_turn}")
                     except Exception as e:
                         log.error(f"❌ TTS plate error: {e}")
-                    # You could optionally add this reply to chat_history as assistant
                     continue
 
-                # Calendar logic (also outside chat_history for now)
+                # Calendar logic
                 if any(k in lower for k in calendar_kw):
                     reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
 
                     if current_turn != current_active_turn_id:
+                        log.info(f"🔁 Calendar turn {current_turn} abandoned (active={current_active_turn_id})")
                         continue
 
                     try:
+                        log.info(f"🎙️ Calendar TTS START turn={current_turn}")
                         tts = await openai_client.audio.speech.create(
                             model="gpt-4o-mini-tts",
                             voice="alloy",
                             input=reply
                         )
                         if current_turn != current_active_turn_id:
+                            log.info(f"🔁 Calendar turn {current_turn} abandoned after TTS (active={current_active_turn_id})")
                             continue
                         try:
                             await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
                         except Exception:
                             pass
                         await ws.send_bytes(await tts.aread())
+                        log.info(f"🎙️ Calendar TTS SENT turn={current_turn}")
                     except Exception as e:
                         log.error(f"❌ TTS calendar error: {e}")
                     continue
 
                 # General GPT logic with conversation history
                 try:
-                    # messages: system + full conversation history
                     messages = [{"role": "system", "content": system_msg}] + chat_history
+                    log.info(f"🤖 GPT START turn={current_turn}, active={current_active_turn_id}, messages_len={len(messages)}")
 
                     stream = await openai_client.chat.completions.create(
                         model=GPT_MODEL,
@@ -406,7 +405,7 @@ async def websocket_handler(ws: WebSocket):
 
                     async for chunk in stream:
                         if current_turn != current_active_turn_id:
-                            log.info(f"🔁 Turn {current_turn} cancelled mid-stream (newer turn {current_active_turn_id} active).")
+                            log.info(f"🔁 CANCEL STREAM turn={current_turn}, active={current_active_turn_id}")
                             break
 
                         delta = getattr(chunk.choices[0].delta, "content", "")
@@ -422,6 +421,7 @@ async def websocket_handler(ws: WebSocket):
                                 break
 
                             try:
+                                log.info(f"🎙️ TTS CHUNK START turn={current_turn}, len={len(buffer)}")
                                 tts = await openai_client.audio.speech.create(
                                     model="gpt-4o-mini-tts",
                                     voice="alloy",
@@ -435,6 +435,7 @@ async def websocket_handler(ws: WebSocket):
                                 except Exception:
                                     pass
                                 await ws.send_bytes(await tts.aread())
+                                log.info(f"🎙️ TTS CHUNK SENT turn={current_turn}")
                             except Exception as e:
                                 log.error(f"❌ TTS stream-chunk error: {e}")
                             buffer = ""
@@ -442,6 +443,7 @@ async def websocket_handler(ws: WebSocket):
                     # Final buffer
                     if buffer.strip() and current_turn == current_active_turn_id:
                         try:
+                            log.info(f"🎙️ TTS FINAL START turn={current_turn}, len={len(buffer.strip())}")
                             tts = await openai_client.audio.speech.create(
                                 model="gpt-4o-mini-tts",
                                 voice="alloy",
@@ -453,12 +455,14 @@ async def websocket_handler(ws: WebSocket):
                                 except Exception:
                                     pass
                                 await ws.send_bytes(await tts.aread())
+                                log.info(f"🎙️ TTS FINAL SENT turn={current_turn}")
                         except Exception as e:
                             log.error(f"❌ TTS final-chunk error: {e}")
 
-                    # Add assistant turn to chat history ONLY if this turn actually finished (still active)
+                    # Add assistant to history only if still active
                     if assistant_full_text.strip() and current_turn == current_active_turn_id:
                         chat_history.append({"role": "assistant", "content": assistant_full_text.strip()})
+                        log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)})")
 
                     asyncio.create_task(mem0_add(user_id, msg))
 
@@ -502,16 +506,6 @@ async def websocket_handler(ws: WebSocket):
                 log.error(f"sample unpack error: {e}")
 
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
-
-            try:
-                if len(audio_bytes) >= 2:
-                    total_samples = len(audio_bytes) // 2
-                    all_samples = struct.unpack("<" + "h" * total_samples, audio_bytes[: total_samples * 2])
-                    peak = max(abs(s) for s in all_samples) if all_samples else 0
-                    rms = (sum(s * s for s in all_samples) / total_samples) ** 0.5 if total_samples > 0 else 0
-                    log.info(f"🔊 PCM STATS — RMS={rms:.2f}, Peak={peak}")
-            except Exception as e:
-                log.error(f"PCM stats error: {e}")
 
             try:
                 await dg_ws.send(audio_bytes)
