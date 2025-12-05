@@ -69,7 +69,7 @@ async def health():
 async def mem0_search(user_id: str, query: str):
   if not MEMO_API_KEY:
       return []
-  headers = {"Authorization": f"Token MEMO_API_KEY"}
+  headers = {"Authorization": f"Token {MEMO_API_KEY}"}
   payload = {"filters": {"user_id": user_id}, "query": query}
   try:
       async with httpx.AsyncClient(timeout=10) as c:
