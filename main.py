@@ -103,7 +103,7 @@ def memory_context(memories: list) -> str:
             lines.append(f"- {txt}")
     return "Relevant memories:\n" + "\n".join(lines)
 
-# ... (get_notion_prompt unchanged) ...
+# ... (get_notion_prompt and n8n helpers unchanged) ...
 
 async def get_notion_prompt():
     if not NOTION_PAGE_ID or not NOTION_API_KEY:
@@ -192,7 +192,7 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"❌ Greeting TTS error: {e}")
 
     # =====================================================
-    # DEEPGRAM CONNECTION (UNCHANGED)
+    # DEEPGRAM CONNECTION (WITH FIXES)
     # =====================================================
     if not DEEPGRAM_API_KEY:
         log.error("❌ No DEEPGRAM_API_KEY set.")
@@ -291,7 +291,7 @@ async def websocket_handler(ws: WebSocket):
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
     # =====================================================
-    # ADD: generation state + cancel event
+    # Minimal addition: generation state and cancel_event
     # =====================================================
     generation_active = False
     cancel_event = asyncio.Event()
@@ -304,7 +304,7 @@ async def websocket_handler(ws: WebSocket):
             log.error(f"send_cancel_tts error: {e}")
 
     # =====================================================
-    # Transcript processor — minimal additions for cancellation
+    # Transcript processor — minimal cancellation hooks
     # =====================================================
     async def transcript_processor():
         nonlocal recent_msgs, processed_messages, prompt, last_audio_time, generation_active, cancel_event
@@ -320,7 +320,7 @@ async def websocket_handler(ws: WebSocket):
 
                 log.info(f"📝 DG transcript: {transcript}")
 
-                # If we are currently generating/speaking, cancel and notify client
+                # If currently generating/speaking, cancel and notify client
                 if generation_active:
                     cancel_event.set()
                     await send_cancel_tts()
