@@ -5,3 +5,5 @@ python-dotenv
 pyngrok
 mem0ai
 pydantic
+websockets
+httpx
