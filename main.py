@@ -392,9 +392,8 @@ async def websocket_handler(ws: WebSocket):
                                         input=buffer
                                     )
                                     await ws.send_bytes(await tts.aread())
-                                } catch (e) {
+                                except Exception as e:
                                     log.error(f"❌ TTS stream-chunk error: {e}")
-                                }
                                 buffer = ""
 
                     if buffer.strip():
