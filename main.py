@@ -314,10 +314,10 @@ async def websocket_handler(ws: WebSocket):
 
                 log.info(f"📝 DG transcript (candidate): '{transcript}'")
 
-                # Accept any transcript with at least one alphabetic character
-                # This ensures interruptions like "why?", "how?", "prevent it" become turns
-                if not any(ch.isalpha() for ch in transcript):
-                    log.info("⏭ Ignoring transcript without alphabetic characters")
+                # Accept any transcript with at least one alphabetic character or digit
+                # This ensures interruptions like "why?", "how?", "prevent it", "911", etc. become turns
+                if not any(ch.isalnum() for ch in transcript):
+                    log.info("⏭ Ignoring transcript without alphanumeric characters")
                     continue
 
                 msg = transcript
