@@ -50,6 +50,9 @@ N8N_PLATE_URL = "https://n8n.marshall321.org/webhook/agent/plate"
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 GPT_MODEL = "gpt-4o"
 
+# How big each TTS text chunk should be (characters) for natural speech
+CHUNK_CHAR_THRESHOLD = 90  # tune between ~60–120
+
 # =====================================================
 # FASTAPI
 # =====================================================
@@ -163,8 +166,13 @@ async def websocket_handler(ws: WebSocket):
     processed_messages = set()
 
     # TURN COUNTER FOR THIS CONNECTION
-    # Each accepted transcript increments turn_id. TTS for that transcript is tagged.
+    # Each accepted transcript increments turn_id.
     turn_id = 0
+
+    # This tracks which turn is currently allowed to generate TTS.
+    # When a new transcript arrives, this is set to that turn, and older
+    # turns stop generating further TTS chunks.
+    current_active_turn_id = 0
 
     calendar_kw = ["calendar", "meeting", "schedule", "appointment"]
     plate_kw = ["plate", "add", "to-do", "task", "notion", "list"]
@@ -189,14 +197,14 @@ async def websocket_handler(ws: WebSocket):
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
 
-    # GREETING TTS (tagged as turn_id 0)
+    # GREETING TTS (turn_id 0, not part of interruption logic)
     try:
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
             voice="alloy",
             input=greet
         )
-        await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": turn_id}))
+        await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": 0}))
         await ws.send_bytes(await tts_greet.aread())
     except Exception as e:
         log.error(f"❌ Greeting TTS error: {e}")
@@ -290,10 +298,10 @@ async def websocket_handler(ws: WebSocket):
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
     # =====================================================
-    # Transcript processor — TURN TAGGING + FASTER GPT/TTS
+    # Transcript processor — TURN TAGGING + CANCELLATION
     # =====================================================
     async def transcript_processor():
-        nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id
+        nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id, current_active_turn_id
         try:
             while True:
                 try:
@@ -317,9 +325,13 @@ async def websocket_handler(ws: WebSocket):
                     continue
                 recent_msgs.append((norm, now))
 
-                # NEW TURN
+                # NEW TURN: each accepted transcript is a new turn.
                 turn_id += 1
                 current_turn = turn_id
+
+                # IMPORTANT: Mark this turn as the ONLY active one.
+                # Any older GPT loops still running will see mismatch and stop.
+                current_active_turn_id = current_turn
 
                 # memory + notion context
                 mems = await mem0_search(user_id, msg)
@@ -341,12 +353,19 @@ async def websocket_handler(ws: WebSocket):
 
                     reply = await send_to_n8n(N8N_PLATE_URL, msg)
 
+                    # Before doing TTS, check if this turn is still active
+                    if current_turn != current_active_turn_id:
+                        continue
+
                     try:
                         tts = await openai_client.audio.speech.create(
                             model="gpt-4o-mini-tts",
                             voice="alloy",
                             input=reply
                         )
+                        # Check again after TTS call (in case of quick double-interrupt)
+                        if current_turn != current_active_turn_id:
+                            continue
                         try:
                             await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
                         except Exception:
@@ -360,12 +379,17 @@ async def websocket_handler(ws: WebSocket):
                 if any(k in lower for k in calendar_kw):
                     reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
 
+                    if current_turn != current_active_turn_id:
+                        continue
+
                     try:
                         tts = await openai_client.audio.speech.create(
                             model="gpt-4o-mini-tts",
                             voice="alloy",
                             input=reply
                         )
+                        if current_turn != current_active_turn_id:
+                            continue
                         try:
                             await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
                         except Exception:
@@ -389,38 +413,56 @@ async def websocket_handler(ws: WebSocket):
                     buffer = ""
 
                     async for chunk in stream:
+                        # If a newer turn became active while streaming, stop immediately.
+                        if current_turn != current_active_turn_id:
+                            log.info(f"🔁 Turn {current_turn} cancelled mid-stream (newer turn {current_active_turn_id} active).")
+                            break
+
                         delta = getattr(chunk.choices[0].delta, "content", "")
-                        if delta:
-                            buffer += delta
+                        if not delta:
+                            continue
 
-                            if len(buffer) > 15:   # send TTS earlier
+                        buffer += delta
+
+                        if len(buffer) > CHUNK_CHAR_THRESHOLD:
+                            # Double-check cancellation before doing TTS
+                            if current_turn != current_active_turn_id:
+                                log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
+                                break
+
+                            try:
+                                tts = await openai_client.audio.speech.create(
+                                    model="gpt-4o-mini-tts",
+                                    voice="alloy",
+                                    input=buffer
+                                )
+                                # Check again after TTS call
+                                if current_turn != current_active_turn_id:
+                                    log.info(f"🔁 Turn {current_turn} cancelled after TTS chunk generation.")
+                                    break
                                 try:
-                                    tts = await openai_client.audio.speech.create(
-                                        model="gpt-4o-mini-tts",
-                                        voice="alloy",
-                                        input=buffer
-                                    )
-                                    try:
-                                        await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
-                                    except Exception:
-                                        pass
-                                    await ws.send_bytes(await tts.aread())
-                                except Exception as e:
-                                    log.error(f"❌ TTS stream-chunk error: {e}")
-                                buffer = ""
+                                    await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
+                                except Exception:
+                                    pass
+                                await ws.send_bytes(await tts.aread())
+                            except Exception as e:
+                                log.error(f"❌ TTS stream-chunk error: {e}")
+                            buffer = ""
 
-                    if buffer.strip():
+                    # Final buffer (if any) for this turn
+                    if buffer.strip() and current_turn == current_active_turn_id:
                         try:
                             tts = await openai_client.audio.speech.create(
                                 model="gpt-4o-mini-tts",
                                 voice="alloy",
                                 input=buffer
                             )
-                            try:
-                                await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
-                            except Exception:
-                                pass
-                            await ws.send_bytes(await tts.aread())
+                            if current_turn == current_active_turn_id:
+                                try:
+                                    await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
+                                except Exception:
+                                    pass
+                                await ws.send_bytes(await tts.aread())
                         except Exception as e:
                             log.error(f"❌ TTS final-chunk error: {e}")
 
