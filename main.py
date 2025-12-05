@@ -138,6 +138,26 @@ async def get_prompt_text():
     return PlainTextResponse(txt, headers={"Access-Control-Allow-Origin": "*"})
 
 # =====================================================
+# N8N HELPER
+# =====================================================
+async def send_to_n8n(url: str, message: str) -> str:
+    """Send a message to an n8n webhook and return the response."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(url, json={"message": message})
+            response.raise_for_status()
+            data = response.json()
+            # Extract response text from various possible formats
+            if isinstance(data, str):
+                return data
+            if isinstance(data, dict):
+                return data.get("response", data.get("text", data.get("message", str(data))))
+            return str(data)
+    except Exception as e:
+        log.error(f"❌ n8n webhook error ({url}): {e}")
+        return "I'm having trouble processing that request right now."
+
+# =====================================================
 # NORMALIZATION
 # =====================================================
 def _normalize(m: str):
@@ -294,12 +314,17 @@ async def websocket_handler(ws: WebSocket):
 
                 log.info(f"📝 DG transcript (candidate): '{transcript}'")
 
-                if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
-                    log.info("⏭ Ignoring very short / non-alpha transcript")
+                # Accept any transcript with at least one alphabetic character
+                # This ensures interruptions like "why?", "how?", "prevent it" become turns
+                if not any(ch.isalpha() for ch in transcript):
+                    log.info("⏭ Ignoring transcript without alphabetic characters")
                     continue
 
                 msg = transcript
                 norm = _normalize(msg)
+                
+                # Less aggressive deduplication: only skip if seen in last 2 seconds
+                # This allows quick re-statements after interrupts to go through
                 now = time.time()
                 recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
                 if any(_is_similar(m, norm) for (m, t) in recent_msgs):
@@ -310,7 +335,12 @@ async def websocket_handler(ws: WebSocket):
                 # Record user message in conversation history
                 chat_history.append({"role": "user", "content": msg})
 
-                # New turn
+                # ============================================================
+                # INTERRUPT/TURN-CANCELLATION LOGIC:
+                # Each new transcript increments turn_id and sets it as the 
+                # current_active_turn_id. This immediately supersedes any 
+                # older turn still streaming GPT/TTS, forcing them to cancel.
+                # ============================================================
                 turn_id += 1
                 current_turn = turn_id
                 current_active_turn_id = current_turn  # supersede older streams
@@ -337,6 +367,7 @@ async def websocket_handler(ws: WebSocket):
 
                     reply = await send_to_n8n(N8N_PLATE_URL, msg)
 
+                    # INTERRUPT CHECK: Before TTS generation
                     if current_turn != current_active_turn_id:
                         log.info(f"🔁 Plate turn {current_turn} abandoned (active={current_active_turn_id})")
                         continue
@@ -348,6 +379,7 @@ async def websocket_handler(ws: WebSocket):
                             voice="alloy",
                             input=reply
                         )
+                        # INTERRUPT CHECK: After TTS generation but before sending
                         if current_turn != current_active_turn_id:
                             log.info(f"🔁 Plate turn {current_turn} abandoned after TTS (active={current_active_turn_id})")
                             continue
@@ -365,6 +397,7 @@ async def websocket_handler(ws: WebSocket):
                 if any(k in lower for k in calendar_kw):
                     reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
 
+                    # INTERRUPT CHECK: Before TTS generation
                     if current_turn != current_active_turn_id:
                         log.info(f"🔁 Calendar turn {current_turn} abandoned (active={current_active_turn_id})")
                         continue
@@ -376,6 +409,7 @@ async def websocket_handler(ws: WebSocket):
                             voice="alloy",
                             input=reply
                         )
+                        # INTERRUPT CHECK: After TTS generation but before sending
                         if current_turn != current_active_turn_id:
                             log.info(f"🔁 Calendar turn {current_turn} abandoned after TTS (active={current_active_turn_id})")
                             continue
@@ -404,6 +438,7 @@ async def websocket_handler(ws: WebSocket):
                     assistant_full_text = ""
 
                     async for chunk in stream:
+                        # INTERRUPT CHECK: If a new turn became active, cancel this stream
                         if current_turn != current_active_turn_id:
                             log.info(f"🔁 CANCEL STREAM turn={current_turn}, active={current_active_turn_id}")
                             break
@@ -416,6 +451,7 @@ async def websocket_handler(ws: WebSocket):
                         buffer += delta
 
                         if len(buffer) > CHUNK_CHAR_THRESHOLD:
+                            # INTERRUPT CHECK: Before generating TTS
                             if current_turn != current_active_turn_id:
                                 log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
                                 break
@@ -427,6 +463,7 @@ async def websocket_handler(ws: WebSocket):
                                     voice="alloy",
                                     input=buffer
                                 )
+                                # INTERRUPT CHECK: After TTS generation but before sending
                                 if current_turn != current_active_turn_id:
                                     log.info(f"🔁 Turn {current_turn} cancelled after TTS chunk generation.")
                                     break
@@ -440,7 +477,7 @@ async def websocket_handler(ws: WebSocket):
                                 log.error(f"❌ TTS stream-chunk error: {e}")
                             buffer = ""
 
-                    # Final buffer
+                    # Final buffer - send remaining text as TTS
                     if buffer.strip() and current_turn == current_active_turn_id:
                         try:
                             log.info(f"🎙️ TTS FINAL START turn={current_turn}, len={len(buffer.strip())}")
@@ -449,6 +486,7 @@ async def websocket_handler(ws: WebSocket):
                                 voice="alloy",
                                 input=buffer
                             )
+                            # INTERRUPT CHECK: Final verification before sending
                             if current_turn == current_active_turn_id:
                                 try:
                                     await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
@@ -497,15 +535,7 @@ async def websocket_handler(ws: WebSocket):
 
             last_audio_time = time.time()
 
-            import struct
-            try:
-                if len(audio_bytes) >= 20:
-                    samples = struct.unpack("<10h", audio_bytes[:20])
-                    log.info(f"PCM samples[0:10] = {list(samples)}")
-            except Exception as e:
-                log.error(f"sample unpack error: {e}")
-
-            log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
+            # Minimal logging to reduce noise (no per-chunk PCM logging)
 
             try:
                 await dg_ws.send(audio_bytes)
