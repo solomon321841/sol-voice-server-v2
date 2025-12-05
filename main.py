@@ -44,7 +44,7 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 GPT_MODEL = "gpt-4o"
 
 # TTS chunk size for natural speech
-CHUNK_CHAR_THRESHOLD = 90  # tweak between ~60–120
+CHUNK_CHAR_THRESHOLD = 90  # tune between ~60–120
 
 # =====================================================
 # FASTAPI
@@ -294,14 +294,16 @@ async def websocket_handler(ws: WebSocket):
 
                 log.info(f"📝 DG transcript (candidate): '{transcript}'")
 
-                if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
+                # Slightly relaxed: allow very short 2-char transcripts
+                if not transcript or len(transcript) < 2 or not any(ch.isalpha() for ch in transcript):
                     log.info("⏭ Ignoring very short / non-alpha transcript")
                     continue
 
                 msg = transcript
                 norm = _normalize(msg)
                 now = time.time()
-                recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
+                # Shorter dedupe window: 1 second
+                recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 1]
                 if any(_is_similar(m, norm) for (m, t) in recent_msgs):
                     log.info(f"⏭ Skipping near-duplicate transcript: '{msg}'")
                     continue
