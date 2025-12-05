@@ -57,11 +57,11 @@ app.add_middleware(
 
 @app.get("/")
 async def home():
-    return {"status": "running", "message": "Silas backend is online."}
+  return {"status": "running", "message": "Silas backend is online."}
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+  return {"ok": True}
 
 # =====================================================
 # MEM0 HELPERS
@@ -187,7 +187,7 @@ async def websocket_handler(ws: WebSocket):
       dg_ws = await websockets.connect(
           dg_url,
           additional_headers=[("Authorization", f"Token {DEEPGRAM_API_KEY}")],
-          ping_interval=20,        # enable periodic pings to keep connection healthy
+          ping_interval=20,
           ping_timeout=20,
           max_size=None,
           close_timeout=5
@@ -240,7 +240,6 @@ async def websocket_handler(ws: WebSocket):
       except Exception as e:
           log.error(f"❌ DG listener fatal unexpected error: {e}")
       finally:
-          # Cleanly close browser ws for this session, but DO NOT shut down app
           try:
               await ws.close(code=1011, reason="Deepgram connection closed")
           except Exception:
@@ -312,9 +311,6 @@ async def websocket_handler(ws: WebSocket):
               )
 
               lower = msg.lower()
-
-              # Plate/calendar omitted here for brevity; same pattern as earlier versions,
-              # but with current_turn != current_active_turn_id checks before/after TTS
 
               # General GPT logic with chat_history
               try:
