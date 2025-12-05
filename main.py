@@ -3,7 +3,6 @@ import json
 import logging
 import asyncio
 import time
-import string
 from typing import List, Dict
 from dotenv import load_dotenv
 import httpx
@@ -44,7 +43,7 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 GPT_MODEL = "gpt-4o"
 
 # TTS chunk size for natural speech
-CHUNK_CHAR_THRESHOLD = 90  # tune between ~60–120
+CHUNK_CHAR_THRESHOLD = 90  # tweak between ~60–120
 
 # =====================================================
 # FASTAPI
@@ -138,17 +137,6 @@ async def get_prompt_text():
     return PlainTextResponse(txt, headers={"Access-Control-Allow-Origin": "*"})
 
 # =====================================================
-# NORMALIZATION
-# =====================================================
-def _normalize(m: str):
-    m = m.lower().strip()
-    m = "".join(ch for ch in m if ch not in string.punctuation)
-    return " ".join(m.split())
-
-def _is_similar(a: str, b: str):
-    return bool(a and b and (a == b or a.startswith(b) or b.startswith(a) or a in b or b in a))
-
-# =====================================================
 # WEBSOCKET HANDLER
 # =====================================================
 @app.websocket("/ws")
@@ -157,8 +145,6 @@ async def websocket_handler(ws: WebSocket):
     await ws.accept()
 
     user_id = "solomon_roth"
-    recent_msgs = []
-    processed_messages = set()
 
     # Conversation history for GPT context
     chat_history = []
@@ -169,9 +155,6 @@ async def websocket_handler(ws: WebSocket):
 
     calendar_kw = ["calendar", "meeting", "schedule", "appointment"]
     plate_kw = ["plate", "add", "to-do", "task", "notion", "list"]
-
-    plate_add_kw = ["add", "put", "create", "new", "include"]
-    plate_check_kw = ["what", "show", "see", "check", "read"]
 
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
@@ -247,7 +230,7 @@ async def websocket_handler(ws: WebSocket):
                         transcript = alts[0].get("transcript", "").strip()
 
                     if transcript:
-                        log.info(f"🧠 Deepgram partial/final transcript: {transcript}")
+                        log.info(f"🧠 Deepgram transcript: {transcript}")
                         await dg_queue.put(transcript)
 
                 except Exception as e:
@@ -281,7 +264,7 @@ async def websocket_handler(ws: WebSocket):
     # Transcript processor — interruption + context
     # =====================================================
     async def transcript_processor():
-        nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id, current_active_turn_id, chat_history
+        nonlocal prompt, last_audio_time, turn_id, current_active_turn_id, chat_history
         try:
             while True:
                 try:
@@ -294,20 +277,12 @@ async def websocket_handler(ws: WebSocket):
 
                 log.info(f"📝 DG transcript (candidate): '{transcript}'")
 
-                # Slightly relaxed: allow very short 2-char transcripts
-                if not transcript or len(transcript) < 2 or not any(ch.isalpha() for ch in transcript):
-                    log.info("⏭ Ignoring very short / non-alpha transcript")
+                # VERY relaxed filter: require at least 1 letter
+                if not any(ch.isalpha() for ch in transcript):
+                    log.info("⏭ Ignoring transcript with no alphabetic chars")
                     continue
 
                 msg = transcript
-                norm = _normalize(msg)
-                now = time.time()
-                # Shorter dedupe window: 1 second
-                recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 1]
-                if any(_is_similar(m, norm) for (m, t) in recent_msgs):
-                    log.info(f"⏭ Skipping near-duplicate transcript: '{msg}'")
-                    continue
-                recent_msgs.append((norm, now))
 
                 # Record user message in conversation history
                 chat_history.append({"role": "user", "content": msg})
@@ -330,13 +305,8 @@ async def websocket_handler(ws: WebSocket):
 
                 lower = msg.lower()
 
-                # Plate logic
+                # Plate logic (kept simple, outside chat history as assistant)
                 if any(k in lower for k in plate_kw):
-                    if msg in processed_messages:
-                        log.info(f"⏭ Plate msg already processed: '{msg}'")
-                        continue
-                    processed_messages.add(msg)
-
                     reply = await send_to_n8n(N8N_PLATE_URL, msg)
 
                     if current_turn != current_active_turn_id:
