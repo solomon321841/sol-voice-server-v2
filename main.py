@@ -40,7 +40,7 @@ N8N_PLATE_URL = "https://n8n.marshall321.org/webhook/agent/plate"
 # MODEL
 # =====================================================
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-GPT_MODEL = "gpt-4o"
+GPT_MODEL = "gpt-5.1"
 
 # TTS chunk size for natural speech
 CHUNK_CHAR_THRESHOLD = 90  # tweak between ~60–120
