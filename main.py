@@ -162,7 +162,7 @@ async def websocket_handler(ws: WebSocket):
     recent_msgs = []
     processed_messages = set()
 
-    # TURN COUNTER FOR THIS CONNECTION (NEW)
+    # TURN COUNTER FOR THIS CONNECTION
     # Each accepted transcript increments turn_id. TTS for that transcript is tagged.
     turn_id = 0
 
@@ -189,21 +189,20 @@ async def websocket_handler(ws: WebSocket):
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
 
-    # GREETING TTS (unchanged, but we tag as turn_id 0)
+    # GREETING TTS (tagged as turn_id 0)
     try:
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
             voice="alloy",
             input=greet
         )
-        # Announce TTS chunk metadata
         await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": turn_id}))
         await ws.send_bytes(await tts_greet.aread())
     except Exception as e:
         log.error(f"❌ Greeting TTS error: {e}")
 
     # =====================================================
-    # DEEPGRAM CONNECTION (WITH FIXES)
+    # DEEPGRAM CONNECTION
     # =====================================================
     if not DEEPGRAM_API_KEY:
         log.error("❌ No DEEPGRAM_API_KEY set.")
@@ -221,7 +220,7 @@ async def websocket_handler(ws: WebSocket):
             dg_url,
             additional_headers=[("Authorization", f"Token {DEEPGRAM_API_KEY}")],
             ping_interval=None,
-            max_size=None,       # prevent deepgram closure on large PCM frames
+            max_size=None,
             close_timeout=0
         )
     except Exception as e:
@@ -237,16 +236,12 @@ async def websocket_handler(ws: WebSocket):
         try:
             async for raw in dg_ws:
                 try:
-                    # websockets library may give str or bytes
                     if isinstance(raw, (bytes, bytearray)):
                         raw_text = raw.decode("utf-8", errors="ignore")
                     else:
                         raw_text = raw
 
                     data = json.loads(raw_text)
-
-                    # Accept known types; Deepgram messages vary by version,
-                    # check for 'type' and 'channel'/'alternatives' shapes.
                     if not isinstance(data, dict):
                         continue
 
@@ -254,15 +249,11 @@ async def websocket_handler(ws: WebSocket):
                     if "channel" in data and isinstance(data["channel"], dict):
                         alts = data["channel"].get("alternatives", [])
                     elif "results" in data and isinstance(data["results"], dict):
-                        # sometimes nested under results
                         ch = data["results"].get("channels", [])
                         if ch and isinstance(ch, list):
                             alts = ch[0].get("alternatives", [])
                         else:
                             alts = data["results"].get("alternatives", [])
-                    else:
-                        # fallback: look for 'transcript' anywhere
-                        pass
 
                     transcript = ""
                     if alts and isinstance(alts, list):
@@ -281,17 +272,14 @@ async def websocket_handler(ws: WebSocket):
     # Keep last audio timestamp for backend keepalive
     last_audio_time = time.time()
 
-    # backend keepalive: send silence to Deepgram when no audio has been forwarded for some time
     async def dg_keepalive_task():
         nonlocal last_audio_time
         try:
             while True:
                 await asyncio.sleep(1.2)
-                # if no real audio for >1.5s send short silence
                 if time.time() - last_audio_time > 1.5:
                     try:
-                        # 100ms silence at 48kHz mono = 4800 samples -> 9600 bytes
-                        silence = (b'\x00\x00') * 4800
+                        silence = (b'\x00\x00') * 4800  # 100ms @ 48kHz
                         await dg_ws.send(silence)
                     except Exception as e:
                         log.error(f"❌ Error sending keepalive to Deepgram: {e}")
@@ -302,7 +290,7 @@ async def websocket_handler(ws: WebSocket):
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
     # =====================================================
-    # Transcript processor — NEW TURN TAGGING + FASTER GPT/TTS
+    # Transcript processor — TURN TAGGING + FASTER GPT/TTS
     # =====================================================
     async def transcript_processor():
         nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id
@@ -318,7 +306,6 @@ async def websocket_handler(ws: WebSocket):
 
                 log.info(f"📝 DG transcript: {transcript}")
 
-                # Basic transcript sanity checks (same as original)
                 if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
                     continue
 
@@ -330,22 +317,14 @@ async def websocket_handler(ws: WebSocket):
                     continue
                 recent_msgs.append((norm, now))
 
-                # NEW TURN: each accepted, de-duplicated transcript is a new turn
+                # NEW TURN
                 turn_id += 1
-                current_turn = turn_id  # capture for closures
+                current_turn = turn_id
 
-                # Optional: tell client a new turn started
-                try:
-                    await ws.send_text(json.dumps({"type": "set_turn", "turn_id": current_turn}))
-                except Exception:
-                    pass
-
-                # Use memory & notion context as before
+                # memory + notion context
                 mems = await mem0_search(user_id, msg)
                 ctx = memory_context(mems)
                 sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
-
-                # NEW: encourage very concise, fast responses
                 system_msg = (
                     sys_prompt
                     + "\n\nSpeaking style: Respond concisely in 1–3 sentences, like live conversation. "
@@ -368,7 +347,6 @@ async def websocket_handler(ws: WebSocket):
                             voice="alloy",
                             input=reply
                         )
-                        # Tag this audio as belonging to current_turn
                         try:
                             await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
                         except Exception:
@@ -395,7 +373,6 @@ async def websocket_handler(ws: WebSocket):
                         await ws.send_bytes(await tts.aread())
                     except Exception as e:
                         log.error(f"❌ TTS calendar error: {e}")
-
                     continue
 
                 # General GPT logic
@@ -403,7 +380,7 @@ async def websocket_handler(ws: WebSocket):
                     stream = await openai_client.chat.completions.create(
                         model=GPT_MODEL,
                         messages=[
-                            {"role": "system", "content": system_msg},  # CHANGED to system_msg
+                            {"role": "system", "content": system_msg},
                             {"role": "user", "content": msg},
                         ],
                         stream=True,
@@ -416,14 +393,13 @@ async def websocket_handler(ws: WebSocket):
                         if delta:
                             buffer += delta
 
-                            if len(buffer) > 15:   # CHANGED: was 40, send TTS earlier
+                            if len(buffer) > 15:   # send TTS earlier
                                 try:
                                     tts = await openai_client.audio.speech.create(
                                         model="gpt-4o-mini-tts",
                                         voice="alloy",
                                         input=buffer
                                     )
-                                    # Tag the chunk with this turn id
                                     try:
                                         await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
                                     except Exception:
@@ -459,12 +435,11 @@ async def websocket_handler(ws: WebSocket):
     transcript_task = asyncio.create_task(transcript_processor())
 
     # =====================================================
-    # MAIN LOOP — receive raw bytes from browser and forward to Deepgram (no blocking)
+    # MAIN LOOP — receive raw bytes from browser and forward to Deepgram
     # =====================================================
     try:
         while True:
             try:
-                # Use receive_bytes to ensure we get binary payloads quickly
                 audio_bytes = await ws.receive_bytes()
             except WebSocketDisconnect:
                 log.info("Browser websocket disconnected")
@@ -477,13 +452,11 @@ async def websocket_handler(ws: WebSocket):
             if not audio_bytes:
                 continue
 
-            # ensure even-length (16-bit alignment)
             if len(audio_bytes) % 2 != 0:
                 audio_bytes = audio_bytes + b'\x00'
 
-            last_audio_time = time.time()  # update keepalive marker
+            last_audio_time = time.time()
 
-            # PCM SAMPLE LOGGING (small sample)
             import struct
             try:
                 if len(audio_bytes) >= 20:
@@ -494,7 +467,6 @@ async def websocket_handler(ws: WebSocket):
 
             log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
 
-            # PCM STATS (RMS/Peak)
             try:
                 if len(audio_bytes) >= 2:
                     total_samples = len(audio_bytes) // 2
@@ -505,20 +477,15 @@ async def websocket_handler(ws: WebSocket):
             except Exception as e:
                 log.error(f"PCM stats error: {e}")
 
-            # FORWARD RAW PCM BYTES DIRECTLY TO DEEPGRAM (non-blocking)
             try:
                 await dg_ws.send(audio_bytes)
             except Exception as e:
                 log.error(f"❌ Error sending audio to Deepgram WS: {e}")
-                # continue forwarding future frames; keepalive_task will try to maintain DG session
                 continue
-
-            # Do NOT wait for transcript here; transcript_task will consume dg_queue independently
 
     except WebSocketDisconnect:
         pass
     finally:
-        # cleanup tasks & sockets
         try:
             keepalive_task.cancel()
         except:
