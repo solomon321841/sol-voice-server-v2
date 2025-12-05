@@ -214,8 +214,8 @@ async def websocket_handler(ws: WebSocket):
             close_timeout=0
         )
     except Exception as e:
-        log.error(f"❌ Failed to connect to Deepgram WS: {e}")
-        return
+            log.error(f"❌ Failed to connect to Deepgram WS: {e}")
+            return
 
     # =====================================================
     # PARALLEL DEEPGRAM LISTENER
@@ -234,8 +234,7 @@ async def websocket_handler(ws: WebSocket):
 
                     data = json.loads(raw_text)
 
-                    # Accept known types; Deepgram messages vary by version,
-                    # check for 'type' and 'channel'/'alternatives' shapes.
+                    # Accept known types; Deepgram messages vary by version
                     if not isinstance(data, dict):
                         continue
 
@@ -243,16 +242,11 @@ async def websocket_handler(ws: WebSocket):
                     if "channel" in data and isinstance(data["channel"], dict):
                         alts = data["channel"].get("alternatives", [])
                     elif "results" in data and isinstance(data["results"], dict):
-                        # sometimes nested under results
                         ch = data["results"].get("channels", [])
                         if ch and isinstance(ch, list):
                             alts = ch[0].get("alternatives", [])
                         else:
                             alts = data["results"].get("alternatives", [])
-                    else:
-                        # fallback: look for 'transcript' anywhere
-                        pass
-
                     transcript = ""
                     if alts and isinstance(alts, list):
                         transcript = alts[0].get("transcript", "").strip()
@@ -291,13 +285,13 @@ async def websocket_handler(ws: WebSocket):
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
     # =====================================================
-    # Minimal addition: generation state and cancel_event
+    # NEW: cancellation + active generation state
     # =====================================================
     generation_active = False
     cancel_event = asyncio.Event()
 
     async def send_cancel_tts():
-        # Notify client to stop any current audio playback/queue
+        # Notify client to stop current playback immediately
         try:
             await ws.send_text(json.dumps({"type": "cancel_tts"}))
         except Exception as e:
@@ -320,7 +314,7 @@ async def websocket_handler(ws: WebSocket):
 
                 log.info(f"📝 DG transcript: {transcript}")
 
-                # If currently generating/speaking, cancel and notify client
+                # If we are currently generating/speaking, cancel and notify client
                 if generation_active:
                     cancel_event.set()
                     await send_cancel_tts()
