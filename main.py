@@ -202,6 +202,9 @@ async def websocket_handler(ws: WebSocket):
         "?model=nova-2"
         "&encoding=linear16"
         "&sample_rate=48000"
+        "&interim_results=true"
+        "&vad_events=true"
+        "&endpointing=50"
     )
 
     try:
