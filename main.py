@@ -237,13 +237,19 @@ def incremental_new_text(old: str, new: str) -> Optional[str]:
 
 def is_reasonable_segment(text: str) -> bool:
     """
-    Filter out junk like 'you', '.', random short stuff.
-    Require:
-      - at least 3 visible chars
-      - contains at least one vowel (rough English heuristic)
+    Very strict filter for what counts as a 'real' spoken turn.
+
+    Requirements:
+      - At least 6 visible characters.
+      - At least 2 words.
+      - Contains at least one vowel (rough English heuristic).
+    This will ignore short/noisy stuff like 'you', '.', 'thanks?', etc.
     """
     t = text.strip()
-    if len(t) < 3:
+    if len(t) < 6:
+        return False
+    words = t.split()
+    if len(words) < 2:
         return False
     vowels = set("aeiouAEIOU")
     if not any(c in vowels for c in t):
@@ -340,7 +346,7 @@ async def websocket_handler(ws: WebSocket):
                     transcript = await openai_client.audio.transcriptions.create(
                         model=ASR_MODEL,
                         file=("audio.wav", wav_bytes, "audio/wav"),
-                        language="en",  # force English to avoid random Korean
+                        language="en",  # force English
                     )
                     text = getattr(transcript, "text", "") or ""
                     text = text.strip()
