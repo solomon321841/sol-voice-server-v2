@@ -3,7 +3,7 @@ import json
 import logging
 import asyncio
 import time
-from typing import List, Dict, Any
+from typing import Dict, Any
 
 import httpx
 from dotenv import load_dotenv
@@ -34,17 +34,9 @@ NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID", "").strip()
 N8N_CALENDAR_URL = "https://n8n.marshall321.org/webhook/calendar-agent"
 N8N_PLATE_URL = "https://n8n.marshall321.org/webhook/agent/plate"
 
-# This is the placeholder key you provided. In a real deployment
-# you should load this from environment, not hard‑code it.
-OPENAI_REALTIME_KEY = (
-    "sk-proj-GCvWjiZQQqEQ6nb2n6F9t_kfyICk2gCoW6RqRYlHnnA38gtmEosOXSQu4dsdrL1C"
-    "08vkpn7LiWT3BlbkFJ7WlgIslbQySdH17_-AcKvWLJB4CMkP_7YOznN3EvW8ky17JlmNfEg"
-    "3vLPkqluIbmzn1_x0V6AA"
-)
-
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-GPT_MODEL = "gpt-5.1"          # used for any text tools if needed
+GPT_MODEL = "gpt-5.1"  # for any text tools if needed
 
 # =====================================================
 # FASTAPI
@@ -75,15 +67,13 @@ async def health():
 @app.get("/realtime-token")
 async def realtime_token():
     """
-    For now, just returns the OpenAI Realtime API key as "token".
-    Your frontend uses this to open the Realtime WebSocket.
-
-    IMPORTANT: in production you should NOT hard-code the key,
-    and you should issue short-lived tokens instead.
+    Returns a token the frontend can use to open the OpenAI Realtime WS.
+    For now, this is just OPENAI_API_KEY from the environment.
+    In production you should ideally mint a short‑lived token instead.
     """
-    if not OPENAI_REALTIME_KEY:
-        return JSONResponse({"error": "Realtime key not configured"}, status_code=500)
-    return JSONResponse({"token": OPENAI_REALTIME_KEY})
+    if not OPENAI_API_KEY:
+        return JSONResponse({"error": "OPENAI_API_KEY not configured"}, status_code=500)
+    return JSONResponse({"token": OPENAI_API_KEY})
 
 
 # =====================================================
@@ -205,11 +195,10 @@ async def send_to_n8n(url: str, msg: str) -> str:
 # =====================================================
 # TOOL ENDPOINTS FOR REALTIME
 # =====================================================
-
 @app.post("/tool/plate")
 async def tool_plate(body: Dict[str, Any]):
     """
-    Tool endpoint for "plate" tasks, to be called from Realtime (via your frontend).
+    Tool endpoint for 'plate' tasks, to be called from Realtime (via your frontend).
     Expected JSON:
       { "query": "text the user said" }
     """
