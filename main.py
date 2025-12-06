@@ -3,18 +3,15 @@ import json
 import logging
 import asyncio
 import time
-import struct
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from openai import AsyncOpenAI
-
-from asyncio import Queue
 
 # =====================================================
 # LOGGING
@@ -37,22 +34,17 @@ NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID", "").strip()
 N8N_CALENDAR_URL = "https://n8n.marshall321.org/webhook/calendar-agent"
 N8N_PLATE_URL = "https://n8n.marshall321.org/webhook/agent/plate"
 
+# This is the placeholder key you provided. In a real deployment
+# you should load this from environment, not hard‑code it.
+OPENAI_REALTIME_KEY = (
+    "sk-proj-GCvWjiZQQqEQ6nb2n6F9t_kfyICk2gCoW6RqRYlHnnA38gtmEosOXSQu4dsdrL1C"
+    "08vkpn7LiWT3BlbkFJ7WlgIslbQySdH17_-AcKvWLJB4CMkP_7YOznN3EvW8ky17JlmNfEg"
+    "3vLPkqluIbmzn1_x0V6AA"
+)
+
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-GPT_MODEL = "gpt-5.1"
-TTS_MODEL = "gpt-4o-mini-tts"
-ASR_MODEL = "whisper-1"  # or "gpt-4o-mini-transcribe" if available
-
-CHUNK_CHAR_THRESHOLD = 90
-
-SAMPLE_RATE = 48000
-BYTES_PER_SAMPLE = 2
-NUM_CHANNELS = 1
-
-MAX_BUFFER_SECONDS = 6.0        # keep last N seconds of audio
-ASR_WINDOW_SECONDS = 1.0        # each transcription window size
-ASR_INTERVAL_SECONDS = 0.7      # how often we call ASR
-ASR_IDLE_TIMEOUT = 1.5          # if no new audio for this long, pause/reset ASR
+GPT_MODEL = "gpt-5.1"          # used for any text tools if needed
 
 # =====================================================
 # FASTAPI
@@ -60,7 +52,7 @@ ASR_IDLE_TIMEOUT = 1.5          # if no new audio for this long, pause/reset ASR
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # tighten to your Netlify origin in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -69,12 +61,29 @@ app.add_middleware(
 
 @app.get("/")
 async def home():
-    return {"status": "running", "message": "Silas backend is online."}
+    return {"status": "running", "message": "Silas backend (Realtime tools) is online."}
 
 
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+# =====================================================
+# REALTIME TOKEN ENDPOINT
+# =====================================================
+@app.get("/realtime-token")
+async def realtime_token():
+    """
+    For now, just returns the OpenAI Realtime API key as "token".
+    Your frontend uses this to open the Realtime WebSocket.
+
+    IMPORTANT: in production you should NOT hard-code the key,
+    and you should issue short-lived tokens instead.
+    """
+    if not OPENAI_REALTIME_KEY:
+        return JSONResponse({"error": "Realtime key not configured"}, status_code=500)
+    return JSONResponse({"token": OPENAI_REALTIME_KEY})
 
 
 # =====================================================
@@ -131,6 +140,9 @@ def memory_context(memories: list) -> str:
 # NOTION PROMPT
 # =====================================================
 async def get_notion_prompt():
+    """
+    Fetches your Silas system prompt from a Notion page.
+    """
     if not NOTION_PAGE_ID or not NOTION_API_KEY:
         return "You are Solomon Roth’s personal AI assistant, Silas."
 
@@ -164,12 +176,16 @@ async def get_notion_prompt():
 
 @app.get("/prompt", response_class=PlainTextResponse)
 async def get_prompt_text():
+    """
+    Expose the system prompt as plain text, if you want to use it
+    in the Realtime session config or for debugging.
+    """
     txt = await get_notion_prompt()
     return PlainTextResponse(txt, headers={"Access-Control-Allow-Origin": "*"})
 
 
 # =====================================================
-# n8n helper
+# n8n helper (calendar / plate)
 # =====================================================
 async def send_to_n8n(url: str, msg: str) -> str:
     try:
@@ -187,448 +203,61 @@ async def send_to_n8n(url: str, msg: str) -> str:
 
 
 # =====================================================
-# WAV WRAPPER FOR PCM
+# TOOL ENDPOINTS FOR REALTIME
 # =====================================================
-def pcm_to_wav_bytes(pcm: bytes, sample_rate: int, num_channels: int) -> bytes:
+
+@app.post("/tool/plate")
+async def tool_plate(body: Dict[str, Any]):
     """
-    Wrap raw PCM16 (little-endian) into a minimal WAV container.
+    Tool endpoint for "plate" tasks, to be called from Realtime (via your frontend).
+    Expected JSON:
+      { "query": "text the user said" }
     """
-    num_samples = len(pcm) // BYTES_PER_SAMPLE
-    byte_rate = sample_rate * num_channels * BYTES_PER_SAMPLE
-    block_align = num_channels * BYTES_PER_SAMPLE
-    bits_per_sample = BYTES_PER_SAMPLE * 8
-    subchunk2_size = len(pcm)
-    chunk_size = 36 + subchunk2_size
-
-    header = struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF",
-        chunk_size,
-        b"WAVE",
-        b"fmt ",
-        16,              # Subchunk1Size for PCM
-        1,               # AudioFormat = 1 (PCM)
-        num_channels,
-        sample_rate,
-        byte_rate,
-        block_align,
-        bits_per_sample,
-        b"data",
-        subchunk2_size,
-    )
-    return header + pcm
+    query = (body or {}).get("query") or ""
+    log.info(f"🧰 /tool/plate called with query={query!r}")
+    reply = await send_to_n8n(N8N_PLATE_URL, query)
+    return JSONResponse({"result": reply})
 
 
-# =====================================================
-# Very strict ASR segment filter
-# =====================================================
-DENYLIST_PHRASES = [
-    "thank you",
-    "thanks",
-    "bye",
-    "goodbye",
-    "hello",
-    "hi",
-    "ok",
-    "okay",
-    "alright",
-    "sure",
-]
-
-def is_reasonable_segment(text: str) -> bool:
+@app.post("/tool/calendar")
+async def tool_calendar(body: Dict[str, Any]):
     """
-    Only accept clear, contentful utterances as turns.
-
-    Requirements:
-      - At least 10 visible characters.
-      - At least 2 words.
-      - Contains at least one vowel.
-      - Does NOT start with a denylisted polite/noise phrase.
+    Tool endpoint for calendar scheduling.
+    Expected JSON:
+      { "query": "text the user said" }
     """
-    t = text.strip()
-    if len(t) < 10:
-        return False
-
-    words = t.split()
-    if len(words) < 2:
-        return False
-
-    lower = t.lower()
-    for phrase in DENYLIST_PHRASES:
-        if lower.startswith(phrase):
-            return False
-
-    vowels = set("aeiouAEIOU")
-    if not any(c in vowels for c in t):
-        return False
-
-    return True
+    query = (body or {}).get("query") or ""
+    log.info(f"🧰 /tool/calendar called with query={query!r}")
+    reply = await send_to_n8n(N8N_CALENDAR_URL, query)
+    return JSONResponse({"result": reply})
 
 
-# =====================================================
-# WEBSOCKET HANDLER (OpenAI ASR instead of Deepgram)
-# =====================================================
-@app.websocket("/ws")
-async def websocket_handler(ws: WebSocket):
-    await ws.accept()
-    user_id = "solomon_roth"
+@app.post("/tool/memories/search")
+async def tool_memories_search(body: Dict[str, Any]):
+    """
+    Search memories via Mem0.
+    Expected JSON:
+      { "user_id": "solomon_roth", "query": "text" }
+    """
+    user_id = (body or {}).get("user_id") or "solomon_roth"
+    query = (body or {}).get("query") or ""
+    log.info(f"🧰 /tool/memories/search user={user_id!r}, query={query!r}")
+    mems = await mem0_search(user_id, query)
+    return JSONResponse({"results": mems})
 
-    # Per-connection state
-    chat_history: list[dict[str, str]] = []
-    turn_id = 0
-    current_active_turn_id = 0
 
-    calendar_kw = ["calendar", "meeting", "schedule", "appointment"]
-    plate_kw = ["plate", "add", "to-do", "task", "notion", "list"]
-
-    prompt = await get_notion_prompt()
-    greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
-
-    # Greeting (turn 0)
-    try:
-        log.info("👋 Sending greeting TTS")
-        tts_greet = await openai_client.audio.speech.create(
-            model=TTS_MODEL,
-            voice="alloy",
-            input=greet,
-        )
-        await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": 0}))
-        await ws.send_bytes(await tts_greet.aread())
-    except Exception as e:
-        log.error(f"❌ Greeting TTS error: {e}")
-
-    # =====================================================
-    # Audio buffer for ASR
-    # =====================================================
-    max_buffer_bytes = int(MAX_BUFFER_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE)
-    asr_window_bytes = int(ASR_WINDOW_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE)
-
-    audio_buffer = bytearray()
-    last_asr_time = 0.0
-    last_buffer_change_time = time.time()
-
-    asr_queue: Queue[str] = Queue()
-
-    # =====================================================
-    # ASR worker: periodically transcribe latest buffer slice
-    # =====================================================
-    async def asr_worker():
-        nonlocal last_asr_time, audio_buffer, last_buffer_change_time
-        try:
-            while True:
-                await asyncio.sleep(ASR_INTERVAL_SECONDS)
-
-                # If no new audio for a while, pause ASR
-                if time.time() - last_buffer_change_time > ASR_IDLE_TIMEOUT:
-                    continue
-
-                if not audio_buffer:
-                    continue
-
-                now = time.time()
-                if now - last_asr_time < ASR_INTERVAL_SECONDS * 0.5:
-                    continue
-                last_asr_time = now
-
-                if len(audio_buffer) <= asr_window_bytes:
-                    window_pcm = bytes(audio_buffer)
-                else:
-                    window_pcm = bytes(audio_buffer[-asr_window_bytes:])
-
-                if not window_pcm:
-                    continue
-
-                wav_bytes = pcm_to_wav_bytes(
-                    window_pcm, sample_rate=SAMPLE_RATE, num_channels=NUM_CHANNELS
-                )
-
-                try:
-                    log.info(
-                        f"🎧 ASR call with {len(window_pcm)} pcm bytes "
-                        f"-> {len(wav_bytes)} wav bytes"
-                    )
-                    transcript = await openai_client.audio.transcriptions.create(
-                        model=ASR_MODEL,
-                        file=("audio.wav", wav_bytes, "audio/wav"),
-                        language="en",  # force English
-                    )
-                    text = getattr(transcript, "text", "") or ""
-                    text = text.strip()
-                    if not text:
-                        continue
-
-                    log.info(f"🧠 ASR full text: '{text}'")
-                    # No incremental diff: just treat this as a candidate segment
-                    await asr_queue.put(text)
-                except Exception as e:
-                    log.error(f"❌ ASR error: {e}")
-                    continue
-
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            log.error(f"❌ asr_worker fatal: {e}")
-
-    asr_task = asyncio.create_task(asr_worker())
-
-    # =====================================================
-    # Transcript processor: ASR text -> turns -> GPT + TTS
-    # =====================================================
-    async def transcript_processor():
-        nonlocal prompt, turn_id, current_active_turn_id, chat_history
-        try:
-            while True:
-                try:
-                    segment = await asr_queue.get()
-                except asyncio.CancelledError:
-                    break
-
-                if not segment:
-                    continue
-
-                msg = segment.strip()
-                if not is_reasonable_segment(msg):
-                    log.info(f"⏭ Ignoring short/noisy ASR segment: '{msg}'")
-                    continue
-
-                log.info(f"📝 ASR segment (candidate): '{msg}'")
-
-                # Append user message
-                chat_history.append({"role": "user", "content": msg})
-
-                # New turn
-                turn_id += 1
-                current_turn = turn_id
-                current_active_turn_id = current_turn
-                log.info(
-                    f"🎯 NEW TURN {current_turn}: '{msg}' "
-                    f"(history len={len(chat_history)})"
-                )
-
-                # Context
-                mems = await mem0_search(user_id, msg)
-                ctx = memory_context(mems)
-                sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
-                system_msg = (
-                    sys_prompt
-                    + "\n\nSpeaking style: Respond concisely in 1–3 sentences, like live conversation. "
-                      "Prioritize fast, direct answers over long explanations."
-                )
-
-                lower = msg.lower()
-
-                # Plate
-                if any(k in lower for k in plate_kw):
-                    reply = await send_to_n8n(N8N_PLATE_URL, msg)
-                    if current_turn != current_active_turn_id:
-                        log.info(
-                            f"🔁 Plate turn {current_turn} abandoned "
-                            f"(active={current_active_turn_id})"
-                        )
-                        continue
-                    try:
-                        tts = await openai_client.audio.speech.create(
-                            model=TTS_MODEL,
-                            voice="alloy",
-                            input=reply,
-                        )
-                        if current_turn != current_active_turn_id:
-                            log.info(
-                                f"🔁 Plate turn {current_turn} abandoned after TTS "
-                                f"(active={current_active_turn_id})"
-                            )
-                            continue
-                        await ws.send_text(
-                            json.dumps(
-                                {"type": "tts_chunk", "turn_id": current_turn}
-                            )
-                        )
-                        await ws.send_bytes(await tts.aread())
-                        log.info(f"🎙️ Plate TTS SENT turn={current_turn}")
-                    except Exception as e:
-                        log.error(f"❌ TTS plate error: {e}")
-                    continue
-
-                # Calendar
-                if any(k in lower for k in calendar_kw):
-                    reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
-                    if current_turn != current_active_turn_id:
-                        log.info(
-                            f"🔁 Calendar turn {current_turn} abandoned "
-                            f"(active={current_active_turn_id})"
-                        )
-                        continue
-                    try:
-                        tts = await openai_client.audio.speech.create(
-                            model=TTS_MODEL,
-                            voice="alloy",
-                            input=reply,
-                        )
-                        if current_turn != current_active_turn_id:
-                            log.info(
-                                f"🔁 Calendar turn {current_turn} abandoned after TTS "
-                                f"(active={current_active_turn_id})"
-                            )
-                            continue
-                        await ws.send_text(
-                            json.dumps(
-                                {"type": "tts_chunk", "turn_id": current_turn}
-                            )
-                        )
-                        await ws.send_bytes(await tts.aread())
-                        log.info(f"🎙️ Calendar TTS SENT turn={current_turn}")
-                    except Exception as e:
-                        log.error(f"❌ TTS calendar error: {e}")
-                    continue
-
-                # GPT + TTS
-                try:
-                    messages = [{"role": "system", "content": system_msg}] + chat_history
-                    log.info(
-                        f"🤖 GPT START turn={current_turn}, "
-                        f"active={current_active_turn_id}, messages_len={len(messages)}"
-                    )
-
-                    stream = await openai_client.chat.completions.create(
-                        model=GPT_MODEL,
-                        messages=messages,
-                        stream=True,
-                    )
-
-                    buffer = ""
-                    assistant_full_text = ""
-
-                    async for chunk in stream:
-                        if current_turn != current_active_turn_id:
-                            log.info(
-                                f"🔁 CANCEL STREAM turn={current_turn}, "
-                                f"active={current_active_turn_id}"
-                            )
-                            break
-
-                        delta = getattr(chunk.choices[0].delta, "content", "")
-                        if not delta:
-                            continue
-
-                        assistant_full_text += delta
-                        buffer += delta
-
-                        if len(buffer) > CHUNK_CHAR_THRESHOLD:
-                            if current_turn != current_active_turn_id:
-                                log.info(
-                                    f"🔁 Turn {current_turn} cancelled "
-                                    f"before TTS chunk."
-                                )
-                                break
-                            try:
-                                tts = await openai_client.audio.speech.create(
-                                    model=TTS_MODEL,
-                                    voice="alloy",
-                                    input=buffer,
-                                )
-                                if current_turn != current_active_turn_id:
-                                    log.info(
-                                        f"🔁 Turn {current_turn} cancelled "
-                                        f"after TTS chunk generation."
-                                    )
-                                    break
-                                await ws.send_text(
-                                    json.dumps(
-                                        {"type": "tts_chunk", "turn_id": current_turn}
-                                    )
-                                )
-                                await ws.send_bytes(await tts.aread())
-                                log.info(f"🎙️ TTS CHUNK SENT turn={current_turn}")
-                            except Exception as e:
-                                log.error(f"❌ TTS stream-chunk error: {e}")
-                            buffer = ""
-
-                    # Final bit
-                    if buffer.strip() and current_turn == current_active_turn_id:
-                        try:
-                            tts = await openai_client.audio.speech.create(
-                                model=TTS_MODEL,
-                                voice="alloy",
-                                input=buffer,
-                            )
-                            if current_turn == current_active_turn_id:
-                                await ws.send_text(
-                                    json.dumps(
-                                        {"type": "tts_chunk", "turn_id": current_turn}
-                                    )
-                                )
-                                await ws.send_bytes(await tts.aread())
-                                log.info(f"🎙️ TTS FINAL SENT turn={current_turn}")
-                        except Exception as e:
-                            log.error(f"❌ TTS final-chunk error: {e}")
-
-                    if assistant_full_text.strip() and current_turn == current_active_turn_id:
-                        chat_history.append(
-                            {"role": "assistant", "content": assistant_full_text.strip()}
-                        )
-                        log.info(
-                            f"💾 Stored assistant turn {current_turn} in history "
-                            f"(len={len(chat_history)})"
-                        )
-
-                    asyncio.create_task(mem0_add(user_id, msg))
-
-                except Exception as e:
-                    log.error(f"LLM error: {e}")
-
-        except Exception as e:
-            log.error(f"❌ transcript_processor fatal: {e}")
-
-    transcript_task = asyncio.create_task(transcript_processor())
-
-    # =====================================================
-    # MAIN LOOP: browser audio -> ASR buffer
-    # =====================================================
-    try:
-        while True:
-            try:
-                audio_bytes = await ws.receive_bytes()
-            except WebSocketDisconnect:
-                log.info("Browser websocket disconnected")
-                break
-            except Exception as e:
-                log.error(f"WebSocket receive error: {e}")
-                await asyncio.sleep(0.05)
-                continue
-
-            if not audio_bytes:
-                continue
-
-            if len(audio_bytes) % 2 != 0:
-                audio_bytes = audio_bytes + b"\x00"
-
-            audio_buffer.extend(audio_bytes)
-            if len(audio_buffer) > max_buffer_bytes:
-                excess = len(audio_buffer) - max_buffer_bytes
-                del audio_buffer[:excess]
-
-            last_buffer_change_time = time.time()
-
-            log.info(
-                f"📡 PCM audio received — {len(audio_bytes)} bytes "
-                f"(buffer={len(audio_buffer)})"
-            )
-
-    except WebSocketDisconnect:
-        pass
-    finally:
-        try:
-            asr_task.cancel()
-        except Exception:
-            pass
-        try:
-            transcript_task.cancel()
-        except Exception:
-            pass
-        try:
-            await ws.close()
-        except Exception:
-            pass
+@app.post("/tool/memories/add")
+async def tool_memories_add(body: Dict[str, Any]):
+    """
+    Add a memory via Mem0.
+    Expected JSON:
+      { "user_id": "solomon_roth", "text": "fact to remember" }
+    """
+    user_id = (body or {}).get("user_id") or "solomon_roth"
+    text = (body or {}).get("text") or ""
+    log.info(f"🧰 /tool/memories/add user={user_id!r}, text={text!r}")
+    asyncio.create_task(mem0_add(user_id, text))
+    return JSONResponse({"status": "queued"})
 
 
 # =====================================================
