@@ -41,7 +41,7 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 GPT_MODEL = "gpt-5.1"
 TTS_MODEL = "gpt-4o-mini-tts"
-ASR_MODEL = "whisper-1"  # or "gpt-4o-mini-transcribe" if your account has it
+ASR_MODEL = "whisper-1"  # or "gpt-4o-mini-transcribe" if available
 
 CHUNK_CHAR_THRESHOLD = 90
 
@@ -52,6 +52,7 @@ NUM_CHANNELS = 1
 MAX_BUFFER_SECONDS = 6.0        # keep last N seconds of audio
 ASR_WINDOW_SECONDS = 1.0        # each transcription window size
 ASR_INTERVAL_SECONDS = 0.7      # how often we call ASR
+ASR_IDLE_TIMEOUT = 1.5          # if no new audio for this long, pause/reset ASR
 
 # =====================================================
 # FASTAPI
@@ -199,14 +200,13 @@ def pcm_to_wav_bytes(pcm: bytes, sample_rate: int, num_channels: int) -> bytes:
     subchunk2_size = len(pcm)
     chunk_size = 36 + subchunk2_size
 
-    # RIFF header
     header = struct.pack(
         "<4sI4s4sIHHIIHH4sI",
         b"RIFF",
         chunk_size,
         b"WAVE",
         b"fmt ",
-        16,              # PCM
+        16,              # Subchunk1Size for PCM
         1,               # AudioFormat = 1 (PCM)
         num_channels,
         sample_rate,
@@ -233,6 +233,22 @@ def incremental_new_text(old: str, new: str) -> Optional[str]:
         return new[len(old):].strip()
     # If not a pure prefix, just return the whole thing
     return new.strip()
+
+
+def is_reasonable_segment(text: str) -> bool:
+    """
+    Filter out junk like 'you', '.', random short stuff.
+    Require:
+      - at least 3 visible chars
+      - contains at least one vowel (rough English heuristic)
+    """
+    t = text.strip()
+    if len(t) < 3:
+        return False
+    vowels = set("aeiouAEIOU")
+    if not any(c in vowels for c in t):
+        return False
+    return True
 
 
 # =====================================================
@@ -276,6 +292,7 @@ async def websocket_handler(ws: WebSocket):
     audio_buffer = bytearray()
     last_asr_text: str = ""
     last_asr_time = 0.0
+    last_buffer_change_time = time.time()
 
     asr_queue: Queue[str] = Queue()
 
@@ -283,10 +300,18 @@ async def websocket_handler(ws: WebSocket):
     # ASR worker: periodically transcribe latest buffer slice
     # =====================================================
     async def asr_worker():
-        nonlocal last_asr_text, last_asr_time, audio_buffer
+        nonlocal last_asr_text, last_asr_time, audio_buffer, last_buffer_change_time
         try:
             while True:
                 await asyncio.sleep(ASR_INTERVAL_SECONDS)
+
+                # If no new audio for a while, reset ASR memory and skip
+                if time.time() - last_buffer_change_time > ASR_IDLE_TIMEOUT:
+                    if last_asr_text:
+                        log.info("🔇 ASR idle timeout, resetting last_asr_text")
+                    last_asr_text = ""
+                    continue
+
                 if not audio_buffer:
                     continue
 
@@ -295,7 +320,6 @@ async def websocket_handler(ws: WebSocket):
                     continue
                 last_asr_time = now
 
-                # Take the last `asr_window_bytes` from buffer
                 if len(audio_buffer) <= asr_window_bytes:
                     window_pcm = bytes(audio_buffer)
                 else:
@@ -304,16 +328,19 @@ async def websocket_handler(ws: WebSocket):
                 if not window_pcm:
                     continue
 
-                # Wrap PCM into WAV
                 wav_bytes = pcm_to_wav_bytes(
                     window_pcm, sample_rate=SAMPLE_RATE, num_channels=NUM_CHANNELS
                 )
 
                 try:
-                    log.info(f"🎧 ASR call with {len(window_pcm)} pcm bytes -> {len(wav_bytes)} wav bytes")
+                    log.info(
+                        f"🎧 ASR call with {len(window_pcm)} pcm bytes "
+                        f"-> {len(wav_bytes)} wav bytes"
+                    )
                     transcript = await openai_client.audio.transcriptions.create(
                         model=ASR_MODEL,
                         file=("audio.wav", wav_bytes, "audio/wav"),
+                        language="en",  # force English to avoid random Korean
                     )
                     text = getattr(transcript, "text", "") or ""
                     text = text.strip()
@@ -353,7 +380,8 @@ async def websocket_handler(ws: WebSocket):
                     continue
 
                 msg = segment.strip()
-                if not any(ch.isalpha() for ch in msg):
+                if not is_reasonable_segment(msg):
+                    log.info(f"⏭ Ignoring short/noisy ASR segment: '{msg}'")
                     continue
 
                 log.info(f"📝 ASR segment (candidate): '{msg}'")
@@ -564,16 +592,15 @@ async def websocket_handler(ws: WebSocket):
             if not audio_bytes:
                 continue
 
-            # Ensure even length
             if len(audio_bytes) % 2 != 0:
                 audio_bytes = audio_bytes + b"\x00"
 
-            # Append to rolling buffer
             audio_buffer.extend(audio_bytes)
             if len(audio_buffer) > max_buffer_bytes:
-                # Keep only last N seconds
                 excess = len(audio_buffer) - max_buffer_bytes
                 del audio_buffer[:excess]
+
+            last_buffer_change_time = time.time()
 
             log.info(
                 f"📡 PCM audio received — {len(audio_bytes)} bytes "
