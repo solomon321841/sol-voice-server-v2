@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 import time
+import struct
 from typing import List, Dict, Any, Optional
 
 import httpx
@@ -40,12 +41,14 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 GPT_MODEL = "gpt-5.1"
 TTS_MODEL = "gpt-4o-mini-tts"
-ASR_MODEL = "gpt-4o-mini-transcribe"  # or "whisper-1" depending on availability
+ASR_MODEL = "whisper-1"  # or "gpt-4o-mini-transcribe" if your account has it
 
 CHUNK_CHAR_THRESHOLD = 90
 
 SAMPLE_RATE = 48000
 BYTES_PER_SAMPLE = 2
+NUM_CHANNELS = 1
+
 MAX_BUFFER_SECONDS = 6.0        # keep last N seconds of audio
 ASR_WINDOW_SECONDS = 1.0        # each transcription window size
 ASR_INTERVAL_SECONDS = 0.7      # how often we call ASR
@@ -183,6 +186,40 @@ async def send_to_n8n(url: str, msg: str) -> str:
 
 
 # =====================================================
+# WAV WRAPPER FOR PCM
+# =====================================================
+def pcm_to_wav_bytes(pcm: bytes, sample_rate: int, num_channels: int) -> bytes:
+    """
+    Wrap raw PCM16 (little-endian) into a minimal WAV container.
+    """
+    num_samples = len(pcm) // BYTES_PER_SAMPLE
+    byte_rate = sample_rate * num_channels * BYTES_PER_SAMPLE
+    block_align = num_channels * BYTES_PER_SAMPLE
+    bits_per_sample = BYTES_PER_SAMPLE * 8
+    subchunk2_size = len(pcm)
+    chunk_size = 36 + subchunk2_size
+
+    # RIFF header
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        chunk_size,
+        b"WAVE",
+        b"fmt ",
+        16,              # PCM
+        1,               # AudioFormat = 1 (PCM)
+        num_channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        subchunk2_size,
+    )
+    return header + pcm
+
+
+# =====================================================
 # Simple incremental diff
 # =====================================================
 def incremental_new_text(old: str, new: str) -> Optional[str]:
@@ -199,7 +236,7 @@ def incremental_new_text(old: str, new: str) -> Optional[str]:
 
 
 # =====================================================
-# WEBSOCKET HANDLER (no Deepgram, OpenAI ASR instead)
+# WEBSOCKET HANDLER (OpenAI ASR instead of Deepgram)
 # =====================================================
 @app.websocket("/ws")
 async def websocket_handler(ws: WebSocket):
@@ -253,7 +290,6 @@ async def websocket_handler(ws: WebSocket):
                 if not audio_buffer:
                     continue
 
-                # Only run ASR if enough time has passed since last call
                 now = time.time()
                 if now - last_asr_time < ASR_INTERVAL_SECONDS * 0.5:
                     continue
@@ -261,25 +297,24 @@ async def websocket_handler(ws: WebSocket):
 
                 # Take the last `asr_window_bytes` from buffer
                 if len(audio_buffer) <= asr_window_bytes:
-                    window = bytes(audio_buffer)
+                    window_pcm = bytes(audio_buffer)
                 else:
-                    window = bytes(audio_buffer[-asr_window_bytes:])
+                    window_pcm = bytes(audio_buffer[-asr_window_bytes:])
 
-                if not window:
+                if not window_pcm:
                     continue
 
-                # Call OpenAI transcription
+                # Wrap PCM into WAV
+                wav_bytes = pcm_to_wav_bytes(
+                    window_pcm, sample_rate=SAMPLE_RATE, num_channels=NUM_CHANNELS
+                )
+
                 try:
-                    log.info(f"🎧 ASR call with {len(window)} bytes")
-                    # Use raw PCM as a "file-like" content
-                    # Some models require a container (wav/webm);
-                    # if so, you'd need to wrap PCM into a WAV header.
+                    log.info(f"🎧 ASR call with {len(window_pcm)} pcm bytes -> {len(wav_bytes)} wav bytes")
                     transcript = await openai_client.audio.transcriptions.create(
                         model=ASR_MODEL,
-                        file=("audio.raw", window, "audio/raw"),
-                        # Add language or other params as needed
+                        file=("audio.wav", wav_bytes, "audio/wav"),
                     )
-                    # transcript.text is typical for whisper-like APIs
                     text = getattr(transcript, "text", "") or ""
                     text = text.strip()
                     if not text:
@@ -317,7 +352,6 @@ async def websocket_handler(ws: WebSocket):
                 if not segment:
                     continue
 
-                # We treat each new ASR segment as a new utterance / turn
                 msg = segment.strip()
                 if not any(ch.isalpha() for ch in msg):
                     continue
@@ -541,7 +575,10 @@ async def websocket_handler(ws: WebSocket):
                 excess = len(audio_buffer) - max_buffer_bytes
                 del audio_buffer[:excess]
 
-            log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes (buffer={len(audio_buffer)})")
+            log.info(
+                f"📡 PCM audio received — {len(audio_bytes)} bytes "
+                f"(buffer={len(audio_buffer)})"
+            )
 
     except WebSocketDisconnect:
         pass
