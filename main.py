@@ -220,40 +220,48 @@ def pcm_to_wav_bytes(pcm: bytes, sample_rate: int, num_channels: int) -> bytes:
 
 
 # =====================================================
-# Simple incremental diff
+# Very strict ASR segment filter
 # =====================================================
-def incremental_new_text(old: str, new: str) -> Optional[str]:
-    """
-    Return the newly added suffix when ASR partials grow over time.
-    If new is shorter or same, return None.
-    """
-    if not new or len(new) <= len(old):
-        return None
-    if new.startswith(old):
-        return new[len(old):].strip()
-    # If not a pure prefix, just return the whole thing
-    return new.strip()
-
+DENYLIST_PHRASES = [
+    "thank you",
+    "thanks",
+    "bye",
+    "goodbye",
+    "hello",
+    "hi",
+    "ok",
+    "okay",
+    "alright",
+    "sure",
+]
 
 def is_reasonable_segment(text: str) -> bool:
     """
-    Very strict filter for what counts as a 'real' spoken turn.
+    Only accept clear, contentful utterances as turns.
 
     Requirements:
-      - At least 6 visible characters.
+      - At least 10 visible characters.
       - At least 2 words.
-      - Contains at least one vowel (rough English heuristic).
-    This will ignore short/noisy stuff like 'you', '.', 'thanks?', etc.
+      - Contains at least one vowel.
+      - Does NOT start with a denylisted polite/noise phrase.
     """
     t = text.strip()
-    if len(t) < 6:
+    if len(t) < 10:
         return False
+
     words = t.split()
     if len(words) < 2:
         return False
+
+    lower = t.lower()
+    for phrase in DENYLIST_PHRASES:
+        if lower.startswith(phrase):
+            return False
+
     vowels = set("aeiouAEIOU")
     if not any(c in vowels for c in t):
         return False
+
     return True
 
 
@@ -296,7 +304,6 @@ async def websocket_handler(ws: WebSocket):
     asr_window_bytes = int(ASR_WINDOW_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE)
 
     audio_buffer = bytearray()
-    last_asr_text: str = ""
     last_asr_time = 0.0
     last_buffer_change_time = time.time()
 
@@ -306,16 +313,13 @@ async def websocket_handler(ws: WebSocket):
     # ASR worker: periodically transcribe latest buffer slice
     # =====================================================
     async def asr_worker():
-        nonlocal last_asr_text, last_asr_time, audio_buffer, last_buffer_change_time
+        nonlocal last_asr_time, audio_buffer, last_buffer_change_time
         try:
             while True:
                 await asyncio.sleep(ASR_INTERVAL_SECONDS)
 
-                # If no new audio for a while, reset ASR memory and skip
+                # If no new audio for a while, pause ASR
                 if time.time() - last_buffer_change_time > ASR_IDLE_TIMEOUT:
-                    if last_asr_text:
-                        log.info("🔇 ASR idle timeout, resetting last_asr_text")
-                    last_asr_text = ""
                     continue
 
                 if not audio_buffer:
@@ -354,11 +358,8 @@ async def websocket_handler(ws: WebSocket):
                         continue
 
                     log.info(f"🧠 ASR full text: '{text}'")
-                    new_part = incremental_new_text(last_asr_text, text)
-                    if new_part:
-                        log.info(f"🧠 ASR new segment: '{new_part}'")
-                        last_asr_text = text
-                        await asr_queue.put(new_part)
+                    # No incremental diff: just treat this as a candidate segment
+                    await asr_queue.put(text)
                 except Exception as e:
                     log.error(f"❌ ASR error: {e}")
                     continue
