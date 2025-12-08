@@ -1,4 +1,5 @@
-# https://github.com/your/repo/blob/main/main.py
+# main.py
+# Updated: smarter punctuation & SSML handling to reduce random commas/periods
 import os
 import json
 import logging
@@ -16,6 +17,7 @@ from openai import AsyncOpenAI
 import websockets
 from asyncio import Queue
 import html
+import re
 
 # =====================================================
 # LOGGING
@@ -36,6 +38,8 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 # Feature flags / tuning via env
 USE_SSML = os.getenv("USE_SSML", "1") == "1"
 CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "40"))  # lower -> start TTS earlier
+# If enabled, we will punctuate only the final chunk (to avoid mid-turn random punctuation)
+PUNCTUATE_FINAL_ONLY = os.getenv("PUNCTUATE_FINAL_ONLY", "1") == "1"
 PUNCTUATE_WITH_LLM = os.getenv("PUNCTUATE_WITH_LLM", "0") == "1"
 
 # =====================================================
@@ -153,7 +157,7 @@ def _is_similar(a: str, b: str):
     return bool(a and b and (a == b or a.startswith(b) or b.startswith(a) or a in b or b in a))
 
 # =====================================================
-# Utility: prepare TTS input with light SSML
+# Utility: prepare TTS input with light SSML and punctuation cleaning
 # =====================================================
 def ensure_sentence_punctuation(s: str) -> str:
     s = s.strip()
@@ -167,17 +171,45 @@ def escape_for_ssml(s: str) -> str:
     return html.escape(s, quote=False)
 
 def make_ssml_from_text(text: str) -> str:
+    # Ensure we don't add destructive punctuation here — SSML only controls pauses.
     t = text.strip()
     if not t:
         return t
     t = ensure_sentence_punctuation(t)
     t_esc = escape_for_ssml(t)
-    t_esc = t_esc.replace(". ", ".<break time=\"180ms\"/> ")
-    t_esc = t_esc.replace(", ", ",<break time=\"60ms\"/> ")
+    # add short breaks after periods and commas to improve naturalness
+    t_esc = re.sub(r"\.\s+", '.<break time="180ms"/> ', t_esc)
+    t_esc = re.sub(r",\s+", ',<break time="60ms"/> ', t_esc)
     return f"<speak>{t_esc}</speak>"
 
+def clean_punctuation(s: str) -> str:
+    """
+    Normalize punctuation to avoid accidental sequences like ',.' or '.,' inserted
+    by mid-chunk punctuation attempts. This function:
+      - collapses repeated punctuation (e.g., '...' -> '.')
+      - removes stray commas before periods (',.' -> '.')
+      - ensures exactly one space after sentence-ending punctuation
+      - removes leading/trailing punctuation
+    """
+    if not s:
+        return s
+    # collapse repeated punctuation
+    s = re.sub(r"([.?!]){2,}", r"\1", s)
+    s = re.sub(r"(,+){2,}", ",", s)
+    # remove comma followed by punctuation like ',.' or ',?' -> '.'
+    s = re.sub(r",\s*([.?!])", r"\1", s)
+    # ensure space after punctuation if letter follows
+    s = re.sub(r"([.?!])([A-Za-z0-9])", r"\1 \2", s)
+    # remove spaces before punctuation
+    s = re.sub(r"\s+([,\.!?])", r"\1", s)
+    # trim leading/trailing punctuation/spaces
+    s = s.strip()
+    s = re.sub(r"^[,\.!?]+\s*", "", s)
+    s = re.sub(r"\s*[,\.!?]+$", lambda m: m.group(0)[-1], s)
+    return s
+
 # =====================================================
-# WEBSOCKET HANDLER - improved: single receiver + cancellable TTS tasks
+# WEBSOCKET HANDLER - improved punctuation behavior
 # =====================================================
 @app.websocket("/ws")
 async def websocket_handler(ws: WebSocket):
@@ -237,13 +269,12 @@ async def websocket_handler(ws: WebSocket):
         return
 
     # Queues & task tracking
-    incoming_audio_queue: Queue = Queue()   # bytes from client -> DG sender
-    dg_transcript_queue: Queue = Queue()   # transcripts from DG listener -> transcript_processor
+    incoming_audio_queue: Queue = Queue()
+    dg_transcript_queue: Queue = Queue()
     tts_tasks_by_turn: Dict[int, Set[asyncio.Task]] = {}
 
     last_audio_time = time.time()
 
-    # -- Deepgram listener (as before) pushes transcripts into dg_transcript_queue
     async def deepgram_listener_task():
         try:
             async for raw in dg_ws:
@@ -321,11 +352,10 @@ async def websocket_handler(ws: WebSocket):
                             continue
                         typ = data.get("type")
                         if typ == "interrupt":
-                            # immediate interrupt: bump active turn and cancel outstanding TTS tasks
                             turn_id += 1
                             current_active_turn_id = turn_id
                             log.info(f"⏹️ Received interrupt from client — new active turn {current_active_turn_id}")
-                            # cancel all outstanding tts tasks for older turns
+                            # cancel outstanding TTS
                             for t_id, tasks in list(tts_tasks_by_turn.items()):
                                 if t_id != current_active_turn_id:
                                     for t in tasks:
@@ -335,15 +365,12 @@ async def websocket_handler(ws: WebSocket):
                                             pass
                                     tts_tasks_by_turn.pop(t_id, None)
                         else:
-                            # other text messages can be logged
                             log.debug(f"WS text message (ignored): {data}")
                     elif "bytes" in msg and msg["bytes"] is not None:
                         audio_bytes = msg["bytes"]
-                        # audio_bytes are forwarded to DG sender via queue
                         await incoming_audio_queue.put(audio_bytes)
                         last_audio_time = time.time()
                     else:
-                        # ignore other forms
                         pass
                 elif mtype == "websocket.disconnect":
                     log.info("WS reader noticed disconnect")
@@ -356,7 +383,7 @@ async def websocket_handler(ws: WebSocket):
     reader_task = asyncio.create_task(ws_reader())
 
     # -----------------------------------------------------
-    # DG audio sender: serializes sending bytes to Deepgram
+    # DG audio sender
     # -----------------------------------------------------
     async def dg_audio_sender():
         try:
@@ -376,32 +403,37 @@ async def websocket_handler(ws: WebSocket):
     dg_sender_task = asyncio.create_task(dg_audio_sender())
 
     # -----------------------------------------------------
-    # Helper: spawn a TTS generation-and-send task (non-blocking)
-    # Each task checks turn validity before sending. Tasks are cancellable.
+    # TTS helper: now accepts is_final flag to control punctuation usage
     # -----------------------------------------------------
-    async def _tts_and_send(tts_text: str, t_turn: int):
-        # prepare payload
+    async def _tts_and_send(tts_text: str, t_turn: int, is_final: bool = False):
         try:
-            if PUNCTUATE_WITH_LLM:
+            # lightly clean raw punctuation first
+            t_clean = clean_punctuation(tts_text)
+
+            # Decide whether to run punctuation LLM:
+            # - only if PUNCTUATE_WITH_LLM is enabled AND (we are final chunk OR PUNCTUATE_FINAL_ONLY==False)
+            use_punctuate = PUNCTUATE_WITH_LLM and (is_final or not PUNCTUATE_FINAL_ONLY)
+
+            if use_punctuate:
                 try:
                     punct_resp = await openai_client.chat.completions.create(
                         model=GPT_MODEL,
                         messages=[
-                            {"role": "system", "content": "Punctuate and improve this text for natural spoken TTS output."},
-                            {"role": "user", "content": tts_text}
+                            {"role": "system", "content": "Punctuate and slightly improve this text for natural spoken TTS output. Keep additions minimal."},
+                            {"role": "user", "content": t_clean}
                         ],
-                        temperature=0,
-                        max_tokens=max(3, int(len(tts_text) * 0.6))
+                        temperature=0.0,
+                        max_tokens=max(3, int(len(t_clean) * 0.6))
                     )
                     punct_text = punct_resp.choices[0].message["content"].strip()
-                    tts_payload = make_ssml_from_text(punct_text) if USE_SSML else punct_text
+                    t_clean = clean_punctuation(punct_text)
                 except Exception as e:
                     log.debug(f"Punctuation LLM failed: {e}")
-                    tts_payload = make_ssml_from_text(tts_text) if USE_SSML else tts_text
-            else:
-                tts_payload = make_ssml_from_text(tts_text) if USE_SSML else tts_text
 
-            # early bail-out if turn changed
+            # prepare SSML (but don't insert new commas/periods here)
+            tts_payload = make_ssml_from_text(t_clean) if USE_SSML else t_clean
+
+            # bail early if turn changed
             if t_turn != current_active_turn_id:
                 log.info(f"🔁 TTS task for turn {t_turn} cancelled before create (active={current_active_turn_id})")
                 return
@@ -412,19 +444,17 @@ async def websocket_handler(ws: WebSocket):
                 input=tts_payload
             )
 
-            # double-check again before sending audio bytes
             if t_turn != current_active_turn_id:
                 log.info(f"🔁 TTS task for turn {t_turn} cancelled after generation (active={current_active_turn_id})")
                 return
 
-            # notify client metadata for upcoming binary frame(s)
             try:
                 await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": t_turn}))
             except Exception:
                 pass
 
-            # stream the audio bytes (aread returns bytes)
             audio_bytes = await tts.aread()
+
             if t_turn != current_active_turn_id:
                 log.info(f"🔁 TTS task for turn {t_turn} cancelled after aread (active={current_active_turn_id})")
                 return
@@ -442,8 +472,7 @@ async def websocket_handler(ws: WebSocket):
             log.error(f"❌ TTS task error for turn {t_turn}: {e}")
 
     # -----------------------------------------------------
-    # Transcript processor: consumes transcripts found by DG listener
-    # Produces LLM completion (streaming) and spawns TTS tasks concurrently.
+    # Transcript processor: spawn TTS tasks; mark final chunk is_final=True
     # -----------------------------------------------------
     async def transcript_processor():
         nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id, current_active_turn_id, chat_history
@@ -496,9 +525,8 @@ async def websocket_handler(ws: WebSocket):
                     if current_turn != current_active_turn_id:
                         log.info(f"🔁 Plate turn {current_turn} abandoned (active={current_active_turn_id})")
                         continue
-                    t_task = asyncio.create_task(_tts_and_send(reply, current_turn))
+                    t_task = asyncio.create_task(_tts_and_send(reply, current_turn, is_final=True))
                     tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
-                    # cleanup finished tasks in background
                     t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
                     continue
 
@@ -508,7 +536,7 @@ async def websocket_handler(ws: WebSocket):
                     if current_turn != current_active_turn_id:
                         log.info(f"🔁 Calendar turn {current_turn} abandoned (active={current_active_turn_id})")
                         continue
-                    t_task = asyncio.create_task(_tts_and_send(reply, current_turn))
+                    t_task = asyncio.create_task(_tts_and_send(reply, current_turn, is_final=True))
                     tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
                     t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
                     continue
@@ -544,17 +572,16 @@ async def websocket_handler(ws: WebSocket):
                                 log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
                                 break
 
-                            # spawn tts task; do not block the token stream
+                            # spawn tts task for this intermediate chunk; mark is_final=False
                             chunk_text = buffer
                             buffer = ""
-                            t_task = asyncio.create_task(_tts_and_send(chunk_text, current_turn))
+                            t_task = asyncio.create_task(_tts_and_send(chunk_text, current_turn, is_final=False))
                             tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
-                            # ensure we remove finished tasks later
                             t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
 
-                    # final buffer
+                    # final buffer -> mark as final so punctuation-run can be used (if enabled)
                     if buffer.strip() and current_turn == current_active_turn_id:
-                        t_task = asyncio.create_task(_tts_and_send(buffer, current_turn))
+                        t_task = asyncio.create_task(_tts_and_send(buffer, current_turn, is_final=True))
                         tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
                         t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
 
@@ -577,12 +604,10 @@ async def websocket_handler(ws: WebSocket):
     # Cleanup & shutdown handling
     # -----------------------------------------------------
     try:
-        # wait for reader to finish (client disconnect) — other tasks run independently
         await reader_task
     except Exception:
         pass
     finally:
-        # cancel tasks/close connections
         try:
             reader_task.cancel()
         except Exception:
@@ -599,7 +624,6 @@ async def websocket_handler(ws: WebSocket):
             keepalive_task.cancel()
         except Exception:
             pass
-        # cancel outstanding TTS tasks
         for tasks in tts_tasks_by_turn.values():
             for t in tasks:
                 try:
