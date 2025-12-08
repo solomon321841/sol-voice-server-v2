@@ -368,9 +368,17 @@ async def websocket_handler(ws: WebSocket):
     # Helper: spawn a TTS generation-and-send task (non-blocking)
     # Each task checks turn validity before sending. Tasks are cancellable.
     # -----------------------------------------------------
+    def _chunk_bytes(data: bytes, size: int = 4096):
+        for i in range(0, len(data), size):
+            yield data[i:i + size]
+
     async def _tts_and_send(tts_text: str, t_turn: int):
         # prepare payload
         try:
+            if t_turn != current_active_turn_id:
+                log.info(f"🔁 TTS task ignored (stale before start) turn={t_turn}, active={current_active_turn_id}")
+                return
+
             if PUNCTUATE_WITH_LLM:
                 try:
                     punct_resp = await openai_client.chat.completions.create(
@@ -382,15 +390,24 @@ async def websocket_handler(ws: WebSocket):
                         temperature=0,
                         max_tokens=max(3, int(len(tts_text) * 0.6))
                     )
+                    if t_turn != current_active_turn_id:
+                        log.info(f"🔁 TTS punctuation stale turn={t_turn}, active={current_active_turn_id}")
+                        return
                     punct_text = punct_resp.choices[0].message["content"].strip()
                     tts_payload = make_ssml_from_text(punct_text) if USE_SSML else punct_text
                 except Exception as e:
                     log.debug(f"Punctuation LLM failed: {e}")
                     tts_payload = make_ssml_from_text(tts_text) if USE_SSML else tts_text
+                    if t_turn != current_active_turn_id:
+                        log.info(f"🔁 TTS punctuation fallback stale turn={t_turn}, active={current_active_turn_id}")
+                        return
             else:
                 tts_payload = make_ssml_from_text(tts_text) if USE_SSML else tts_text
+                if t_turn != current_active_turn_id:
+                    log.info(f"🔁 TTS payload stale turn={t_turn}, active={current_active_turn_id}")
+                    return
 
-            # early bail-out if turn changed
+            # early bail-out if turn changed before create
             if t_turn != current_active_turn_id:
                 log.info(f"🔁 TTS task for turn {t_turn} cancelled before create (active={current_active_turn_id})")
                 return
@@ -400,16 +417,21 @@ async def websocket_handler(ws: WebSocket):
                 voice="verse",
                 input=tts_payload
             )
-
-            # double-check again before sending audio bytes
             if t_turn != current_active_turn_id:
-                log.info(f"🔁 TTS task for turn {t_turn} cancelled after generation (active={current_active_turn_id})")
+                log.info(f"🔁 TTS task for turn {t_turn} cancelled after create (active={current_active_turn_id})")
                 return
 
             # notify client metadata for upcoming binary frame(s)
             try:
                 await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": t_turn}))
+                if t_turn != current_active_turn_id:
+                    log.info(f"🔁 TTS task for turn {t_turn} stale after metadata send (active={current_active_turn_id})")
+                    return
             except Exception:
+                if t_turn != current_active_turn_id:
+                    log.info(f"🔁 TTS metadata send exception; stale turn={t_turn}, active={current_active_turn_id}")
+                    return
+                # swallow send_text errors but continue to chunk send
                 pass
 
             # stream the audio bytes (aread returns bytes)
@@ -418,11 +440,21 @@ async def websocket_handler(ws: WebSocket):
                 log.info(f"🔁 TTS task for turn {t_turn} cancelled after aread (active={current_active_turn_id})")
                 return
 
-            try:
-                await ws.send_bytes(audio_bytes)
-                log.info(f"🎙️ TTS SENT for turn={t_turn}, len={len(audio_bytes)}")
-            except Exception as e:
-                log.error(f"Failed to send TTS bytes for turn {t_turn}: {e}")
+            # chunked send with turn checks between chunks
+            for chunk in _chunk_bytes(audio_bytes, size=4096):
+                if t_turn != current_active_turn_id:
+                    log.info(f"🔁 TTS chunk send aborted (stale) turn={t_turn}, active={current_active_turn_id}")
+                    return
+                try:
+                    await ws.send_bytes(chunk)
+                except Exception as e:
+                    log.error(f"Failed to send TTS bytes chunk for turn {t_turn}: {e}")
+                    return
+                if t_turn != current_active_turn_id:
+                    log.info(f"🔁 TTS chunk send aborted after send (stale) turn={t_turn}, active={current_active_turn_id}")
+                    return
+
+            log.info(f"🎙️ TTS SENT for turn={t_turn}, len={len(audio_bytes)}")
 
         except asyncio.CancelledError:
             log.info(f"🔁 TTS task for turn {t_turn} cancelled (task cancelled).")
