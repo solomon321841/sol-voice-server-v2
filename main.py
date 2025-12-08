@@ -36,7 +36,7 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 
 # Feature flags / tuning via env
 USE_SSML = os.getenv("USE_SSML", "1") == "1"
-CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "40"))  # lower -> start TTS earlier
+CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "20"))  # lower -> start TTS earlier
 PUNCTUATE_WITH_LLM = os.getenv("PUNCTUATE_WITH_LLM", "0") == "1"
 COGNITIVE_PACING_MS = int(os.getenv("COGNITIVE_PACING_MS", "60"))  # 40–70ms is ideal
 SPEECH_RESHAPE = os.getenv("SPEECH_RESHAPE", "0") == "1"
