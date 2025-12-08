@@ -163,7 +163,7 @@ def make_ssml_from_text(text: str) -> str:
     if not t:
         return t
     t_esc = escape_for_ssml(t)
-    return f"<speak>{t_esc}</speak>"
+    return f'<speak><prosody rate="1.12">{t_esc}</prosody></speak>'
 
 # =====================================================
 # WEBSOCKET HANDLER - improved: single receiver + cancellable TTS tasks
