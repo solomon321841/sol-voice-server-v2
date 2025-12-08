@@ -75,7 +75,7 @@ async def health():
 async def mem0_search(user_id: str, query: str):
     if not MEMO_API_KEY:
         return []
-    headers = {"Authorization": f"Token MEMO_API_KEY"}
+    headers = {"Authorization": f"Token {MEMO_API_KEY}"}
     payload = {"filters": {"user_id": user_id}, "query": query}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
@@ -266,8 +266,12 @@ async def websocket_handler(ws: WebSocket):
 
                 except Exception as e:
                     log.error(f"❌ DG parse error: {e}")
+        except websockets.exceptions.ConnectionClosedOK:
+            log.info("Deepgram connection closed cleanly.")
+        except websockets.exceptions.ConnectionClosedError:
+            log.warning("Deepgram connection closed by server.")
         except Exception as e:
-            log.error(f"❌ DG listener fatal: {e}")
+            log.info(f"Deepgram listener stopped: {e}")
 
     asyncio.create_task(deepgram_listener_task())
 
@@ -278,6 +282,8 @@ async def websocket_handler(ws: WebSocket):
                 await asyncio.sleep(1.2)
                 if time.time() - last_audio_time > 1.5:
                     try:
+                        if getattr(dg_ws, "closed", False):
+                            break
                         silence = (b"\x00\x00") * 4800
                         await dg_ws.send(silence)
                         log.info("📨 Sent DG keepalive silence")
@@ -323,6 +329,12 @@ async def websocket_handler(ws: WebSocket):
                                         except Exception:
                                             pass
                                     tts_tasks_by_turn.pop(t_id, None)
+                            # drain transcript queue so old speech doesn't leak through
+                            try:
+                                while True:
+                                    dg_transcript_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
                         else:
                             # other text messages can be logged
                             log.debug(f"WS text message (ignored): {data}")
@@ -493,6 +505,8 @@ async def websocket_handler(ws: WebSocket):
 
                 # record user in history
                 chat_history.append({"role": "user", "content": msg})
+                # keep history short to reduce latency
+                chat_history[:] = chat_history[-6:]
 
                 # new turn
                 turn_id += 1
@@ -599,6 +613,8 @@ async def websocket_handler(ws: WebSocket):
                     # add assistant to history only if still active
                     if assistant_full_text.strip() and current_turn == current_active_turn_id:
                         chat_history.append({"role": "assistant", "content": assistant_full_text.strip()})
+                        # keep history short to reduce latency
+                        chat_history[:] = chat_history[-6:]
                         log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)})")
 
                     asyncio.create_task(mem0_add(user_id, msg))
