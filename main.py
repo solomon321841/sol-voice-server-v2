@@ -16,7 +16,6 @@ import websockets
 from asyncio import Queue
 import html
 from collections import deque
-import random
 
 # =====================================================
 # LOGGING
@@ -45,8 +44,6 @@ BASE_PROSODY_RATE = float(os.getenv("BASE_PROSODY_RATE", "1.30"))
 MIN_PROSODY_RATE = float(os.getenv("MIN_PROSODY_RATE", "1.20"))
 MAX_PROSODY_RATE = float(os.getenv("MAX_PROSODY_RATE", "1.55"))
 MOMENTUM_ALPHA = float(os.getenv("MOMENTUM_ALPHA", "0.15"))
-BREATH_MODEL = os.getenv("BREATH_MODEL", "0") == "1"
-MULTI_SENTENCE_SEGMENTS = os.getenv("MULTI_SENTENCE_SEGMENTS", "0") == "1"
 
 # =====================================================
 # n8n ENDPOINTS
@@ -103,7 +100,7 @@ async def health():
 async def mem0_search(user_id: str, query: str):
     if not MEMO_API_KEY:
         return []
-    headers = {"Authorization": f"Token {MEMO_API_KEY}"}
+    headers = {"Authorization": f"Token MEMO_API_KEY"}
     payload = {"filters": {"user_id": user_id}, "query": query}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
@@ -418,8 +415,8 @@ async def websocket_handler(ws: WebSocket):
     async def _tts_and_send(tts_text: str, t_turn: int):
         # prepare payload
         try:
-            # if SPEECH_RESHAPE:
-            #     tts_text = await reshape_for_speech(tts_text)
+            if SPEECH_RESHAPE:
+                tts_text = await reshape_for_speech(tts_text)
 
             seg_rate = compute_rate_for_segment(tts_text)
 
@@ -533,19 +530,21 @@ async def websocket_handler(ws: WebSocket):
                 ctx = memory_context(mems)
                 sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
                 system_msg = (
-                    f"{sys_prompt}"
-                    "\n\nSpeaking style:\n"
-                    "- Respond naturally, like a live conversation, in short spoken segments.\n"
-                    "- Each completed thought MUST end with <SEG>.\n"
-                    "- Each segment should be 4–10 words.\n"
-                    "- Never output <SEG> inside an unfinished thought.\n"
-                    "\nVoice behavior:\n"
-                    "- Use conversational language and contractions.\n"
-                    "- Prioritize fast, direct responses over long explanations.\n"
-                    "- Maintain context from previous turns.\n"
-                    "\nPacing:\n"
-                    "\nBreathing:\n"
-                    "- Use a very small natural micro-pause between segments (20ms–50ms), not a large pause."
+                    sys_prompt
+                    + "\n\nSpeaking style: Respond concisely in 1–3 sentences, like live conversation. "
+                      "Prioritize fast, direct answers over long explanations."
+                      "\nFrom now on, output in clean spoken segments.\n"
+                      "Each complete thought MUST end with the token <SEG>.\n"
+                      "Each segment should be 6–14 words.\n"
+                      "Never place <SEG> mid-thought.\n"
+                      "Never output extremely short segments (under 4 words).\n"
+                      "Your voice output depends on these segments being natural."
+                      "\nUse conversational context from earlier turns to stay coherent, concise, and human-like."
+                      "\nCognitive pacing rules:\n"
+                      "Before producing a segment, think through the idea internally.\n"
+                      "Then express the thought clearly in natural spoken language.\n"
+                      "Never rush. Never output half-formed ideas.\n"
+                      "Each <SEG> should represent one clean, complete thought."
                 )
 
                 lower = msg.lower()
@@ -620,9 +619,7 @@ async def websocket_handler(ws: WebSocket):
                                 break
 
                             chunk_text = seg
-                            if BREATH_MODEL:
-                                await asyncio.sleep(random.uniform(0.02, 0.05))
-                            # await asyncio.sleep(COGNITIVE_PACING_MS / 1000.0)
+                            await asyncio.sleep(COGNITIVE_PACING_MS / 1000.0)
                             t_task = asyncio.create_task(_tts_and_send(chunk_text, current_turn))
                             tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
                             # ensure we remove finished tasks later
