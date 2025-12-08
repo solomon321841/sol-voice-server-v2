@@ -192,7 +192,7 @@ async def websocket_handler(ws: WebSocket):
         greet_input = make_ssml_from_text(greet) if USE_SSML else greet
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
-            voice="alloy",
+            voice="echo",
             input=greet_input
         )
         await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": 0}))
