@@ -36,7 +36,7 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 
 # Feature flags / tuning via env
 USE_SSML = os.getenv("USE_SSML", "1") == "1"
-CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "20"))  # lower -> start TTS earlier
+CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "40"))  # lower -> start TTS earlier
 PUNCTUATE_WITH_LLM = os.getenv("PUNCTUATE_WITH_LLM", "0") == "1"
 COGNITIVE_PACING_MS = int(os.getenv("COGNITIVE_PACING_MS", "60"))  # 40–70ms is ideal
 SPEECH_RESHAPE = os.getenv("SPEECH_RESHAPE", "0") == "1"
@@ -537,15 +537,13 @@ async def websocket_handler(ws: WebSocket):
                     "\n\nSpeaking style:\n"
                     "- Respond naturally, like a live conversation, in short spoken segments.\n"
                     "- Each completed thought MUST end with <SEG>.\n"
-                    "- Each segment should be 6–16 words.\n"
+                    "- Each segment should be 4–10 words.\n"
                     "- Never output <SEG> inside an unfinished thought.\n"
                     "\nVoice behavior:\n"
                     "- Use conversational language and contractions.\n"
                     "- Prioritize fast, direct responses over long explanations.\n"
                     "- Maintain context from previous turns.\n"
                     "\nPacing:\n"
-                    "- Think briefly before each <SEG>.\n"
-                    "- Never output half-formed ideas.\n"
                     "\nBreathing:\n"
                     "- Use a very small natural micro-pause between segments (20ms–50ms), not a large pause."
                 )
@@ -624,7 +622,7 @@ async def websocket_handler(ws: WebSocket):
                             chunk_text = seg
                             if BREATH_MODEL:
                                 await asyncio.sleep(random.uniform(0.02, 0.05))
-                            await asyncio.sleep(0.03)
+                            # await asyncio.sleep(COGNITIVE_PACING_MS / 1000.0)
                             t_task = asyncio.create_task(_tts_and_send(chunk_text, current_turn))
                             tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
                             # ensure we remove finished tasks later
