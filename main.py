@@ -1,3 +1,4 @@
+# (modified) main.py
 import os
 import json
 import logging
@@ -14,6 +15,7 @@ import uvicorn
 from openai import AsyncOpenAI
 import websockets
 from asyncio import Queue
+import html
 
 # =====================================================
 # LOGGING
@@ -31,6 +33,12 @@ NOTION_API_KEY = os.getenv("NOTION_API_KEY", "").strip()
 NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID", "").strip()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 
+# Feature flags / tuning via env
+USE_SSML = os.getenv("USE_SSML", "1") == "1"
+CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "60"))  # lowered from 90 to 60 to start TTS earlier
+# If you want an expensive punctuation call to the LLM before TTS, set to "1"
+PUNCTUATE_WITH_LLM = os.getenv("PUNCTUATE_WITH_LLM", "0") == "1"
+
 # =====================================================
 # n8n ENDPOINTS
 # =====================================================
@@ -42,9 +50,6 @@ N8N_PLATE_URL = "https://n8n.marshall321.org/webhook/agent/plate"
 # =====================================================
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 GPT_MODEL = "gpt-5.1"
-
-# TTS chunk size for natural speech
-CHUNK_CHAR_THRESHOLD = 90  # tweak between ~60–120
 
 # =====================================================
 # FASTAPI
@@ -68,6 +73,7 @@ async def health():
 
 # =====================================================
 # MEM0 HELPERS
+# (unchanged)
 # =====================================================
 async def mem0_search(user_id: str, query: str):
     if not MEMO_API_KEY:
@@ -107,6 +113,7 @@ def memory_context(memories: list) -> str:
 
 # =====================================================
 # NOTION PROMPT
+# (unchanged)
 # =====================================================
 async def get_notion_prompt():
     if not NOTION_PAGE_ID or not NOTION_API_KEY:
@@ -149,6 +156,34 @@ def _is_similar(a: str, b: str):
     return bool(a and b and (a == b or a.startswith(b) or b.startswith(a) or a in b or b in a))
 
 # =====================================================
+# Utility: prepare TTS input with light SSML
+# =====================================================
+def ensure_sentence_punctuation(s: str) -> str:
+    s = s.strip()
+    if not s:
+        return s
+    if s[-1] not in ".!?":
+        s = s + "."
+    return s
+
+def escape_for_ssml(s: str) -> str:
+    # basic escape for XML
+    return html.escape(s, quote=False)
+
+def make_ssml_from_text(text: str) -> str:
+    # lightweight: ensure punctuation and add short breaks for better prosody
+    t = text.strip()
+    if not t:
+        return t
+    t = ensure_sentence_punctuation(t)
+    # escape xml chars
+    t_esc = escape_for_ssml(t)
+    # add short breaks after periods and commas to improve naturalness
+    t_esc = t_esc.replace(". ", ".<break time=\"220ms\"/> ")
+    t_esc = t_esc.replace(", ", ",<break time=\"70ms\"/> ")
+    return f"<speak>{t_esc}</speak>"
+
+# =====================================================
 # WEBSOCKET HANDLER
 # =====================================================
 @app.websocket("/ws")
@@ -179,10 +214,11 @@ async def websocket_handler(ws: WebSocket):
     # GREETING
     try:
         log.info("👋 Sending greeting TTS")
+        greet_input = make_ssml_from_text(greet) if USE_SSML else greet
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
             voice="alloy",
-            input=greet
+            input=greet_input
         )
         await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": 0}))
         await ws.send_bytes(await tts_greet.aread())
@@ -278,6 +314,41 @@ async def websocket_handler(ws: WebSocket):
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
     # =====================================================
+    # Add a small ws text listener so client can send "interrupt" events immediately
+    # =====================================================
+    async def ws_text_listener():
+        nonlocal turn_id, current_active_turn_id
+        try:
+            while True:
+                try:
+                    msg = await ws.receive_text()
+                except WebSocketDisconnect:
+                    break
+                except Exception as e:
+                    # occasionally receive_text may fail while bytes flow; sleep and retry
+                    log.debug(f"ws_text_listener read error: {e}")
+                    await asyncio.sleep(0.05)
+                    continue
+
+                try:
+                    data = json.loads(msg)
+                except Exception:
+                    continue
+
+                typ = data.get("type")
+                if typ == "interrupt":
+                    # create a brand new turn id to supersede any active turn
+                    turn_id += 1
+                    current_active_turn_id = turn_id
+                    log.info(f"⏹️ Received interrupt from client — new active turn {current_active_turn_id}")
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            log.error(f"ws_text_listener fatal: {e}")
+
+    text_task = asyncio.create_task(ws_text_listener())
+
+    # =====================================================
     # Transcript processor — interruption + context
     # =====================================================
     async def transcript_processor():
@@ -343,10 +414,11 @@ async def websocket_handler(ws: WebSocket):
 
                     try:
                         log.info(f"🎙️ Plate TTS START turn={current_turn}")
+                        tts_input = make_ssml_from_text(reply) if USE_SSML else reply
                         tts = await openai_client.audio.speech.create(
                             model="gpt-4o-mini-tts",
                             voice="alloy",
-                            input=reply
+                            input=tts_input
                         )
                         if current_turn != current_active_turn_id:
                             log.info(f"🔁 Plate turn {current_turn} abandoned after TTS (active={current_active_turn_id})")
@@ -371,10 +443,11 @@ async def websocket_handler(ws: WebSocket):
 
                     try:
                         log.info(f"🎙️ Calendar TTS START turn={current_turn}")
+                        tts_input = make_ssml_from_text(reply) if USE_SSML else reply
                         tts = await openai_client.audio.speech.create(
                             model="gpt-4o-mini-tts",
                             voice="alloy",
-                            input=reply
+                            input=tts_input
                         )
                         if current_turn != current_active_turn_id:
                             log.info(f"🔁 Calendar turn {current_turn} abandoned after TTS (active={current_active_turn_id})")
@@ -422,10 +495,31 @@ async def websocket_handler(ws: WebSocket):
 
                             try:
                                 log.info(f"🎙️ TTS CHUNK START turn={current_turn}, len={len(buffer)}")
+                                # Prepare TTS input (SSML/punctuation)
+                                tts_payload = make_ssml_from_text(buffer) if USE_SSML else buffer
+
+                                # optionally perform LLM punctuation step here (if enabled)
+                                # NOTE: enabling this will increase latency but can help prosody
+                                if PUNCTUATE_WITH_LLM:
+                                    try:
+                                        punct_resp = await openai_client.chat.completions.create(
+                                            model=GPT_MODEL,
+                                            messages=[
+                                                {"role": "system", "content": "Punctuate and improve this text for natural spoken TTS output."},
+                                                {"role": "user", "content": buffer}
+                                            ],
+                                            temperature=0,
+                                            max_tokens= max(3, int(len(buffer) * 0.5))
+                                        )
+                                        punct_text = punct_resp.choices[0].message["content"].strip()
+                                        tts_payload = make_ssml_from_text(punct_text) if USE_SSML else punct_text
+                                    except Exception as e:
+                                        log.debug(f"Punctuation LLM failed: {e}")
+
                                 tts = await openai_client.audio.speech.create(
                                     model="gpt-4o-mini-tts",
                                     voice="alloy",
-                                    input=buffer
+                                    input=tts_payload
                                 )
                                 if current_turn != current_active_turn_id:
                                     log.info(f"🔁 Turn {current_turn} cancelled after TTS chunk generation.")
@@ -444,10 +538,28 @@ async def websocket_handler(ws: WebSocket):
                     if buffer.strip() and current_turn == current_active_turn_id:
                         try:
                             log.info(f"🎙️ TTS FINAL START turn={current_turn}, len={len(buffer.strip())}")
+                            tts_payload = make_ssml_from_text(buffer) if USE_SSML else buffer
+
+                            if PUNCTUATE_WITH_LLM:
+                                try:
+                                    punct_resp = await openai_client.chat.completions.create(
+                                        model=GPT_MODEL,
+                                        messages=[
+                                            {"role": "system", "content": "Punctuate and improve this text for natural spoken TTS output."},
+                                            {"role": "user", "content": buffer}
+                                        ],
+                                        temperature=0,
+                                        max_tokens= max(3, int(len(buffer) * 0.5))
+                                    )
+                                    punct_text = punct_resp.choices[0].message["content"].strip()
+                                    tts_payload = make_ssml_from_text(punct_text) if USE_SSML else punct_text
+                                except Exception as e:
+                                    log.debug(f"Punctuation LLM failed on final chunk: {e}")
+
                             tts = await openai_client.audio.speech.create(
                                 model="gpt-4o-mini-tts",
                                 voice="alloy",
-                                input=buffer
+                                input=tts_payload
                             )
                             if current_turn == current_active_turn_id:
                                 try:
@@ -522,6 +634,10 @@ async def websocket_handler(ws: WebSocket):
             pass
         try:
             transcript_task.cancel()
+        except:
+            pass
+        try:
+            text_task.cancel()
         except:
             pass
         try:
