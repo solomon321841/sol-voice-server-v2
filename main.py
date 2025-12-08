@@ -475,6 +475,10 @@ async def websocket_handler(ws: WebSocket):
                     sys_prompt
                     + "\n\nSpeaking style: Respond concisely in 1–3 sentences, like live conversation. "
                       "Prioritize fast, direct answers over long explanations."
+                      "\nFrom now on, emit your response in semantic segments. "
+                      "Each complete thought should end with the special token <SEG>. "
+                      "Do NOT put <SEG> mid-thought. "
+                      "A segment is typically 3–12 words and should reflect a natural spoken phrase."
                 )
 
                 lower = msg.lower()
@@ -520,6 +524,16 @@ async def websocket_handler(ws: WebSocket):
                     buffer = ""
                     assistant_full_text = ""
 
+                    def _extract_segments(buf: str):
+                        segments = []
+                        while "<SEG>" in buf:
+                            idx = buf.index("<SEG>")
+                            seg = buf[:idx].strip()
+                            if seg:
+                                segments.append(seg)
+                            buf = buf[idx+5:]
+                        return segments, buf
+
                     async for chunk in stream:
                         if current_turn != current_active_turn_id:
                             log.info(f"🔁 CANCEL STREAM turn={current_turn}, active={current_active_turn_id}")
@@ -532,14 +546,13 @@ async def websocket_handler(ws: WebSocket):
                         assistant_full_text += delta
                         buffer += delta
 
-                        if _ready_to_speak(buffer):
+                        segments, buffer = _extract_segments(buffer)
+                        for seg in segments:
                             if current_turn != current_active_turn_id:
                                 log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
                                 break
 
-                            # spawn tts task; do not block the token stream
-                            chunk_text = buffer
-                            buffer = ""
+                            chunk_text = seg
                             t_task = asyncio.create_task(_tts_and_send(chunk_text, current_turn))
                             tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
                             # ensure we remove finished tasks later
