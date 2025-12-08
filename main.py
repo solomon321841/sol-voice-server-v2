@@ -163,7 +163,7 @@ def make_ssml_from_text(text: str) -> str:
     if not t:
         return t
     t_esc = escape_for_ssml(t)
-    return f'<speak><prosody rate="1.45">{t_esc}</prosody></speak>'
+    return f'<speak><prosody rate="1.22">{t_esc}</prosody></speak>'
 
 # =====================================================
 # WEBSOCKET HANDLER - improved: single receiver + cancellable TTS tasks
@@ -310,7 +310,7 @@ async def websocket_handler(ws: WebSocket):
                             continue
                         typ = data.get("type")
                         if typ == "interrupt":
-                            # immediate interrupt: bump active turn and cancel outstanding TTS tasks
+                            # immediate interrupt: 
                             turn_id += 1
                             current_active_turn_id = turn_id
                             log.info(f"⏹️ Received interrupt from client — new active turn {current_active_turn_id}")
