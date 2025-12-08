@@ -15,6 +15,7 @@ from openai import AsyncOpenAI
 import websockets
 from asyncio import Queue
 import html
+from collections import deque
 
 # =====================================================
 # LOGGING
@@ -36,6 +37,13 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 USE_SSML = os.getenv("USE_SSML", "1") == "1"
 CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "40"))  # lower -> start TTS earlier
 PUNCTUATE_WITH_LLM = os.getenv("PUNCTUATE_WITH_LLM", "0") == "1"
+COGNITIVE_PACING_MS = int(os.getenv("COGNITIVE_PACING_MS", "60"))  # 40–70ms is ideal
+SPEECH_RESHAPE = os.getenv("SPEECH_RESHAPE", "0") == "1"
+MOMENTUM_ENABLED = os.getenv("MOMENTUM_ENABLED", "1") == "1"
+BASE_PROSODY_RATE = float(os.getenv("BASE_PROSODY_RATE", "1.30"))
+MIN_PROSODY_RATE = float(os.getenv("MIN_PROSODY_RATE", "1.20"))
+MAX_PROSODY_RATE = float(os.getenv("MAX_PROSODY_RATE", "1.55"))
+MOMENTUM_ALPHA = float(os.getenv("MOMENTUM_ALPHA", "0.15"))
 
 # =====================================================
 # n8n ENDPOINTS
@@ -48,6 +56,23 @@ N8N_PLATE_URL = "https://n8n.marshall321.org/webhook/agent/plate"
 # =====================================================
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 GPT_MODEL = "gpt-5.1"
+
+_recent_rates = deque(maxlen=5)
+
+def compute_rate_for_segment(text: str) -> float:
+    if not MOMENTUM_ENABLED:
+        return BASE_PROSODY_RATE
+    words = len(text.split())
+    target = BASE_PROSODY_RATE
+    if words <= 6:
+        target += 0.05
+    elif words >= 14:
+        target -= 0.03
+    prev = _recent_rates[-1] if _recent_rates else BASE_PROSODY_RATE
+    rate = prev + MOMENTUM_ALPHA * (target - prev)
+    rate = max(MIN_PROSODY_RATE, min(MAX_PROSODY_RATE, rate))
+    _recent_rates.append(rate)
+    return rate
 
 # =====================================================
 # FASTAPI
@@ -158,12 +183,30 @@ def escape_for_ssml(s: str) -> str:
     # basic escape for XML
     return html.escape(s, quote=False)
 
-def make_ssml_from_text(text: str) -> str:
+async def reshape_for_speech(text: str) -> str:
+    # Tiny, low-cost rewrite for natural spoken English; contractions, smoother cadence.
+    try:
+        resp = await openai_client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=[
+                {"role": "system", "content": "Rewrite the user's text into natural spoken English for voice TTS. Keep meaning, use contractions, avoid long sentences, avoid hedging, 1 short spoken clause. No markup."},
+                {"role": "user", "content": text}
+            ],
+            temperature=0.2,
+            max_tokens=min(60, max(20, len(text)//2))
+        )
+        out = resp.choices[0].message["content"].strip()
+        return out or text
+    except Exception:
+        return text
+
+def make_ssml_from_text(text: str, rate: float = None) -> str:
     t = text.strip()
     if not t:
         return t
     t_esc = escape_for_ssml(t)
-    return f'<speak><prosody rate="1.12">{t_esc}</prosody></speak>'
+    r = rate if rate is not None else BASE_PROSODY_RATE
+    return f'<speak><prosody rate="{r:.2f}">{t_esc}</prosody></speak>'
 
 # =====================================================
 # WEBSOCKET HANDLER - improved: single receiver + cancellable TTS tasks
@@ -189,7 +232,8 @@ async def websocket_handler(ws: WebSocket):
     # Greeting
     try:
         log.info("👋 Sending greeting TTS")
-        greet_input = make_ssml_from_text(greet) if USE_SSML else greet
+        greet_rate = compute_rate_for_segment(greet)
+        greet_input = make_ssml_from_text(greet, greet_rate) if USE_SSML else greet
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
             voice="alloy",
@@ -371,6 +415,11 @@ async def websocket_handler(ws: WebSocket):
     async def _tts_and_send(tts_text: str, t_turn: int):
         # prepare payload
         try:
+            if SPEECH_RESHAPE:
+                tts_text = await reshape_for_speech(tts_text)
+
+            seg_rate = compute_rate_for_segment(tts_text)
+
             if PUNCTUATE_WITH_LLM:
                 try:
                     punct_resp = await openai_client.chat.completions.create(
@@ -383,12 +432,21 @@ async def websocket_handler(ws: WebSocket):
                         max_tokens=max(3, int(len(tts_text) * 0.6))
                     )
                     punct_text = punct_resp.choices[0].message["content"].strip()
-                    tts_payload = make_ssml_from_text(punct_text) if USE_SSML else punct_text
+                    if USE_SSML:
+                        tts_payload = make_ssml_from_text(punct_text, seg_rate)
+                    else:
+                        tts_payload = punct_text
                 except Exception as e:
                     log.debug(f"Punctuation LLM failed: {e}")
-                    tts_payload = make_ssml_from_text(tts_text) if USE_SSML else tts_text
+                    if USE_SSML:
+                        tts_payload = make_ssml_from_text(tts_text, seg_rate)
+                    else:
+                        tts_payload = tts_text
             else:
-                tts_payload = make_ssml_from_text(tts_text) if USE_SSML else tts_text
+                if USE_SSML:
+                    tts_payload = make_ssml_from_text(tts_text, seg_rate)
+                else:
+                    tts_payload = tts_text
 
             # early bail-out if turn changed
             if t_turn != current_active_turn_id:
@@ -475,10 +533,18 @@ async def websocket_handler(ws: WebSocket):
                     sys_prompt
                     + "\n\nSpeaking style: Respond concisely in 1–3 sentences, like live conversation. "
                       "Prioritize fast, direct answers over long explanations."
-                      "\nFrom now on, emit your response in semantic segments. "
-                      "Each complete thought should end with the special token <SEG>. "
-                      "Do NOT put <SEG> mid-thought. "
-                      "A segment is typically 3–12 words and should reflect a natural spoken phrase."
+                      "\nFrom now on, output in clean spoken segments.\n"
+                      "Each complete thought MUST end with the token <SEG>.\n"
+                      "Each segment should be 6–14 words.\n"
+                      "Never place <SEG> mid-thought.\n"
+                      "Never output extremely short segments (under 4 words).\n"
+                      "Your voice output depends on these segments being natural."
+                      "\nUse conversational context from earlier turns to stay coherent, concise, and human-like."
+                      "\nCognitive pacing rules:\n"
+                      "Before producing a segment, think through the idea internally.\n"
+                      "Then express the thought clearly in natural spoken language.\n"
+                      "Never rush. Never output half-formed ideas.\n"
+                      "Each <SEG> should represent one clean, complete thought."
                 )
 
                 lower = msg.lower()
@@ -553,6 +619,7 @@ async def websocket_handler(ws: WebSocket):
                                 break
 
                             chunk_text = seg
+                            await asyncio.sleep(COGNITIVE_PACING_MS / 1000.0)
                             t_task = asyncio.create_task(_tts_and_send(chunk_text, current_turn))
                             tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
                             # ensure we remove finished tasks later
