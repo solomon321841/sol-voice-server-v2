@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 import time
+import string
 from typing import List, Dict, Set
 from dotenv import load_dotenv
 import httpx
@@ -34,6 +35,7 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 # Feature flags / tuning via env
 USE_SSML = os.getenv("USE_SSML", "1") == "1"
 CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "40"))  # lower -> start TTS earlier
+PUNCTUATE_WITH_LLM = os.getenv("PUNCTUATE_WITH_LLM", "0") == "1"
 
 # =====================================================
 # n8n ENDPOINTS
@@ -70,6 +72,21 @@ async def health():
 # =====================================================
 # MEM0 HELPERS
 # =====================================================
+async def mem0_search(user_id: str, query: str):
+    if not MEMO_API_KEY:
+        return []
+    headers = {"Authorization": f"Token MEMO_API_KEY"}
+    payload = {"filters": {"user_id": user_id}, "query": query}
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post("https://api.mem0.ai/v2/memories/", headers=headers, json=payload)
+            if r.status_code == 200:
+                out = r.json()
+                return out if isinstance(out, list) else []
+    except Exception as e:
+        log.error(f"MEM0 search error: {e}")
+    return []
+
 async def mem0_add(user_id: str, text: str):
     if not MEMO_API_KEY or not text:
         return
@@ -80,6 +97,16 @@ async def mem0_add(user_id: str, text: str):
             await c.post("https://api.mem0.ai/v1/memories/", headers=headers, json=payload)
     except Exception as e:
         log.error(f"MEM0 add error: {e}")
+
+def memory_context(memories: list) -> str:
+    if not memories:
+        return ""
+    lines = []
+    for m in memories:
+        txt = m.get("memory") or m.get("content") or m.get("text")
+        if txt:
+            lines.append(f"- {txt}")
+    return "Relevant memories:\n" + "\n".join(lines)
 
 # =====================================================
 # NOTION PROMPT
@@ -99,14 +126,11 @@ async def get_notion_prompt():
             r = await c.get(url, headers=headers)
             r.raise_for_status()
             data = r.json()
-            paragraphs = []
+            parts = []
             for blk in data.get("results", []):
                 if blk.get("type") == "paragraph":
-                    para = "".join([t.get("plain_text", "") for t in blk["paragraph"]["rich_text"]]).strip()
-                    if para:
-                        paragraphs.append(para)
-            trimmed = paragraphs[:3]
-            return "\n".join(trimmed).strip() or "You are Solomon Roth’s AI assistant, Silas."
+                    parts.append("".join([t.get("plain_text", "") for t in blk["paragraph"]["rich_text"]]))
+            return "\n".join(parts).strip() or "You are Solomon Roth’s AI assistant, Silas."
     except Exception as e:
         log.error(f"❌ Notion error: {e}")
         return "You are Solomon Roth’s AI assistant, Silas."
@@ -115,6 +139,17 @@ async def get_notion_prompt():
 async def get_prompt_text():
     txt = await get_notion_prompt()
     return PlainTextResponse(txt, headers={"Access-Control-Allow-Origin": "*"})
+
+# =====================================================
+# NORMALIZATION
+# =====================================================
+def _normalize(m: str):
+    m = m.lower().strip()
+    m = "".join(ch for ch in m if ch not in string.punctuation)
+    return " ".join(m.split())
+
+def _is_similar(a: str, b: str):
+    return bool(a and b and (a == b or a.startswith(b) or b.startswith(a) or a in b or b in a))
 
 # =====================================================
 # Utility: prepare TTS input with light SSML
@@ -138,6 +173,7 @@ async def websocket_handler(ws: WebSocket):
     await ws.accept()
 
     user_id = "solomon_roth"
+    recent_msgs = []
     processed_messages = set()
 
     chat_history: List[Dict] = []
@@ -335,7 +371,24 @@ async def websocket_handler(ws: WebSocket):
     async def _tts_and_send(tts_text: str, t_turn: int):
         # prepare payload
         try:
-            tts_payload = make_ssml_from_text(tts_text) if USE_SSML else tts_text
+            if PUNCTUATE_WITH_LLM:
+                try:
+                    punct_resp = await openai_client.chat.completions.create(
+                        model=GPT_MODEL,
+                        messages=[
+                            {"role": "system", "content": "Punctuate and improve this text for natural spoken TTS output."},
+                            {"role": "user", "content": tts_text}
+                        ],
+                        temperature=0,
+                        max_tokens=max(3, int(len(tts_text) * 0.6))
+                    )
+                    punct_text = punct_resp.choices[0].message["content"].strip()
+                    tts_payload = make_ssml_from_text(punct_text) if USE_SSML else punct_text
+                except Exception as e:
+                    log.debug(f"Punctuation LLM failed: {e}")
+                    tts_payload = make_ssml_from_text(tts_text) if USE_SSML else tts_text
+            else:
+                tts_payload = make_ssml_from_text(tts_text) if USE_SSML else tts_text
 
             # early bail-out if turn changed
             if t_turn != current_active_turn_id:
@@ -381,8 +434,12 @@ async def websocket_handler(ws: WebSocket):
     # Transcript processor: consumes transcripts found by DG listener
     # Produces LLM completion (streaming) and spawns TTS tasks concurrently.
     # -----------------------------------------------------
+    def _ready_to_speak(buf: str) -> bool:
+        # Speak when the model finishes a thought OR the buffer gets long
+        return any(p in buf for p in [".", "?", "!"]) or len(buf) >= CHUNK_CHAR_THRESHOLD
+
     async def transcript_processor():
-        nonlocal processed_messages, prompt, last_audio_time, turn_id, current_active_turn_id, chat_history
+        nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id, current_active_turn_id, chat_history
         try:
             while True:
                 transcript = await dg_transcript_queue.get()
@@ -394,10 +451,16 @@ async def websocket_handler(ws: WebSocket):
                     continue
 
                 msg = transcript
+                norm = _normalize(msg)
+                now = time.time()
+                recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
+                if any(_is_similar(m, norm) for (m, t) in recent_msgs):
+                    log.info(f"⏭ Skipping near-duplicate transcript: '{msg}'")
+                    continue
+                recent_msgs.append((norm, now))
 
                 # record user in history
                 chat_history.append({"role": "user", "content": msg})
-                chat_history[:] = chat_history[-4:]
 
                 # new turn
                 turn_id += 1
@@ -405,7 +468,18 @@ async def websocket_handler(ws: WebSocket):
                 current_active_turn_id = current_turn
                 log.info(f"🎯 NEW TURN {current_turn}: '{msg}' (history len={len(chat_history)})")
 
-                sys_prompt = prompt
+                mems = await mem0_search(user_id, msg)
+                ctx = memory_context(mems)
+                sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
+                system_msg = (
+                    sys_prompt
+                    + "\n\nSpeaking style: Respond concisely in 1–3 sentences, like live conversation. "
+                      "Prioritize fast, direct answers over long explanations."
+                    + "\nFrom now on, emit your response in semantic segments. "
+                      "Each complete thought should end with the special token <SEG>. "
+                      "Do NOT put <SEG> mid-thought. "
+                      "A segment is typically 3–12 words and should reflect a natural spoken phrase."
+                )
 
                 lower = msg.lower()
 
@@ -438,14 +512,7 @@ async def websocket_handler(ws: WebSocket):
 
                 # General GPT streaming -> spawn non-blocking TTS for chunks
                 try:
-                    system_msg = (
-                        "You are Silas speaking naturally to Marshall.\n"
-                        "Start speaking immediately.\n"
-                        "Output short conversational segments and end each with <SEG>.\n"
-                        "Do not plan the full response before speaking.\n"
-                        "Keep segments loose, natural, and human."
-                    )
-                    messages = [{"role": "system", "content": system_msg}] + chat_history[-4:]
+                    messages = [{"role": "system", "content": system_msg}] + chat_history
                     log.info(f"🤖 GPT START turn={current_turn}, active={current_active_turn_id}, messages_len={len(messages)}")
 
                     stream = await openai_client.chat.completions.create(
@@ -500,7 +567,6 @@ async def websocket_handler(ws: WebSocket):
                     # add assistant to history only if still active
                     if assistant_full_text.strip() and current_turn == current_active_turn_id:
                         chat_history.append({"role": "assistant", "content": assistant_full_text.strip()})
-                        chat_history[:] = chat_history[-4:]
                         log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)})")
 
                     asyncio.create_task(mem0_add(user_id, msg))
