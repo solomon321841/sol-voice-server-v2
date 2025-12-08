@@ -103,7 +103,7 @@ async def health():
 async def mem0_search(user_id: str, query: str):
     if not MEMO_API_KEY:
         return []
-    headers = {"Authorization": f"Token MEMO_API_KEY"}
+    headers = {"Authorization": f"Token {MEMO_API_KEY}"}
     payload = {"filters": {"user_id": user_id}, "query": query}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
@@ -418,8 +418,8 @@ async def websocket_handler(ws: WebSocket):
     async def _tts_and_send(tts_text: str, t_turn: int):
         # prepare payload
         try:
-            if SPEECH_RESHAPE:
-                tts_text = await reshape_for_speech(tts_text)
+            # if SPEECH_RESHAPE:
+            #     tts_text = await reshape_for_speech(tts_text)
 
             seg_rate = compute_rate_for_segment(tts_text)
 
@@ -532,35 +532,25 @@ async def websocket_handler(ws: WebSocket):
                 mems = await mem0_search(user_id, msg)
                 ctx = memory_context(mems)
                 sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
-                seg_rule_text = (
-                    "\nFrom now on, output in clean spoken segments.\n"
-                    "Each complete thought MUST end with the token <SEG>.\n"
-                    "Each segment should be 6–14 words.\n"
-                    "Never place <SEG> mid-thought.\n"
-                    "Never output extremely short segments (under 4 words).\n"
-                    "Your voice output depends on these segments being natural."
-                )
-                if MULTI_SENTENCE_SEGMENTS:
-                    seg_rule_text = (
-                        "\nFrom now on, output in clean spoken segments.\n"
-                        "Each complete thought MUST end with the token <SEG>.\n"
-                        "Each segment may contain 1–2 short sentences, under 22 words total.\n"
-                        "Never place <SEG> mid-thought.\n"
-                        "Never output extremely short segments (under 4 words).\n"
-                        "Your voice output depends on these segments being natural."
-                    )
                 system_msg = (
-                    sys_prompt
-                    + "\n\nSpeaking style: Respond concisely in 1–3 sentences, like live conversation. "
-                      "Prioritize fast, direct answers over long explanations."
-                      + seg_rule_text +
-                      "\nUse conversational context from earlier turns to stay coherent, concise, and human-like."
-                      "\nCognitive pacing rules:\n"
-                      "Before producing a segment, think through the idea internally.\n"
-                      "Then express the thought clearly in natural spoken language.\n"
-                      "Never rush. Never output half-formed ideas.\n"
-                      "Each <SEG> should represent one clean, complete thought."
-                      "\nBefore generating each <SEG> segment, internally summarize the user intent and required knowledge in one sentence; do not output this summary."
+                    f"{sys_prompt}"
+                    "\n\nSpeaking style:\n"
+                    "- Respond naturally, like a live conversation, in short spoken segments.\n"
+                    "- Each completed thought MUST end with <SEG>.\n"
+                    "- Each segment should be 6–16 words.\n"
+                    "- Never output <SEG> inside an unfinished thought.\n"
+                    "\nReasoning:\n"
+                    "- Before generating each <SEG>, silently summarize the user intent and the required info in one sentence.\n"
+                    "- Do NOT output that summary; use it just to guide your next spoken segment.\n"
+                    "\nVoice behavior:\n"
+                    "- Use conversational language and contractions.\n"
+                    "- Prioritize fast, direct responses over long explanations.\n"
+                    "- Maintain context from previous turns.\n"
+                    "\nPacing:\n"
+                    "- Think briefly before each <SEG>.\n"
+                    "- Never output half-formed ideas.\n"
+                    "\nBreathing:\n"
+                    "- Use a very small natural micro-pause between segments (20ms–50ms), not a large pause."
                 )
 
                 lower = msg.lower()
@@ -636,8 +626,8 @@ async def websocket_handler(ws: WebSocket):
 
                             chunk_text = seg
                             if BREATH_MODEL:
-                                await asyncio.sleep(random.uniform(0.06, 0.11))
-                            await asyncio.sleep(COGNITIVE_PACING_MS / 1000.0)
+                                await asyncio.sleep(random.uniform(0.02, 0.05))
+                            await asyncio.sleep(0.03)
                             t_task = asyncio.create_task(_tts_and_send(chunk_text, current_turn))
                             tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
                             # ensure we remove finished tasks later
