@@ -16,6 +16,7 @@ import websockets
 from asyncio import Queue
 import html
 from collections import deque
+import random
 
 # =====================================================
 # LOGGING
@@ -44,6 +45,7 @@ BASE_PROSODY_RATE = float(os.getenv("BASE_PROSODY_RATE", "1.30"))
 MIN_PROSODY_RATE = float(os.getenv("MIN_PROSODY_RATE", "1.20"))
 MAX_PROSODY_RATE = float(os.getenv("MAX_PROSODY_RATE", "1.55"))
 MOMENTUM_ALPHA = float(os.getenv("MOMENTUM_ALPHA", "0.15"))
+BREATH_MODEL = os.getenv("BREATH_MODEL", "0") == "1"
 
 # =====================================================
 # n8n ENDPOINTS
@@ -619,6 +621,8 @@ async def websocket_handler(ws: WebSocket):
                                 break
 
                             chunk_text = seg
+                            if BREATH_MODEL:
+                                await asyncio.sleep(random.uniform(0.06, 0.11))
                             await asyncio.sleep(COGNITIVE_PACING_MS / 1000.0)
                             t_task = asyncio.create_task(_tts_and_send(chunk_text, current_turn))
                             tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
