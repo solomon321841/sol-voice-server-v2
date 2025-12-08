@@ -1,4 +1,3 @@
-# https://github.com/your/repo/blob/main/main.py
 import os
 import json
 import logging
@@ -155,29 +154,15 @@ def _is_similar(a: str, b: str):
 # =====================================================
 # Utility: prepare TTS input with light SSML
 # =====================================================
-def ensure_sentence_punctuation(s: str) -> str:
-    s = s.strip()
-    if not s:
-        return s
-    if s[-1] not in ".!?":
-        s = s + "."
-    return s
-
 def escape_for_ssml(s: str) -> str:
     # basic escape for XML
     return html.escape(s, quote=False)
 
 def make_ssml_from_text(text: str) -> str:
-    # lightweight: ensure punctuation and add short breaks for better prosody
     t = text.strip()
     if not t:
         return t
-    t = ensure_sentence_punctuation(t)
-    # escape xml chars
     t_esc = escape_for_ssml(t)
-    # add short breaks after periods and commas to improve naturalness
-    t_esc = t_esc.replace(". ", ".<break time=\"220ms\"/> ")
-    t_esc = t_esc.replace(", ", ",<break time=\"70ms\"/> ")
     return f"<speak>{t_esc}</speak>"
 
 # =====================================================
@@ -449,6 +434,10 @@ async def websocket_handler(ws: WebSocket):
     # Transcript processor: consumes transcripts found by DG listener
     # Produces LLM completion (streaming) and spawns TTS tasks concurrently.
     # -----------------------------------------------------
+    def _ready_to_speak(buf: str) -> bool:
+        # Speak when the model finishes a thought OR the buffer gets long
+        return any(p in buf for p in [".", "?", "!"]) or len(buf) >= CHUNK_CHAR_THRESHOLD
+
     async def transcript_processor():
         nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id, current_active_turn_id, chat_history
         try:
@@ -543,7 +532,7 @@ async def websocket_handler(ws: WebSocket):
                         assistant_full_text += delta
                         buffer += delta
 
-                        if len(buffer) >= CHUNK_CHAR_THRESHOLD:
+                        if _ready_to_speak(buffer):
                             if current_turn != current_active_turn_id:
                                 log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
                                 break
