@@ -445,7 +445,7 @@ async def websocket_handler(ws: WebSocket):
                         "Do not plan the full response before speaking.\n"
                         "Keep segments loose, natural, and human."
                     )
-                    messages = [{"role": "system", "content": system_msg}] + chat_history[-8:]
+                    messages = [{"role": "system", "content": system_msg}] + chat_history[-4:]
                     log.info(f"🤖 GPT START turn={current_turn}, active={current_active_turn_id}, messages_len={len(messages)}")
 
                     stream = await openai_client.chat.completions.create(
