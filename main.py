@@ -46,6 +46,7 @@ MIN_PROSODY_RATE = float(os.getenv("MIN_PROSODY_RATE", "1.20"))
 MAX_PROSODY_RATE = float(os.getenv("MAX_PROSODY_RATE", "1.55"))
 MOMENTUM_ALPHA = float(os.getenv("MOMENTUM_ALPHA", "0.15"))
 BREATH_MODEL = os.getenv("BREATH_MODEL", "0") == "1"
+MULTI_SENTENCE_SEGMENTS = os.getenv("MULTI_SENTENCE_SEGMENTS", "0") == "1"
 
 # =====================================================
 # n8n ENDPOINTS
@@ -531,22 +532,35 @@ async def websocket_handler(ws: WebSocket):
                 mems = await mem0_search(user_id, msg)
                 ctx = memory_context(mems)
                 sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
+                seg_rule_text = (
+                    "\nFrom now on, output in clean spoken segments.\n"
+                    "Each complete thought MUST end with the token <SEG>.\n"
+                    "Each segment should be 6–14 words.\n"
+                    "Never place <SEG> mid-thought.\n"
+                    "Never output extremely short segments (under 4 words).\n"
+                    "Your voice output depends on these segments being natural."
+                )
+                if MULTI_SENTENCE_SEGMENTS:
+                    seg_rule_text = (
+                        "\nFrom now on, output in clean spoken segments.\n"
+                        "Each complete thought MUST end with the token <SEG>.\n"
+                        "Each segment may contain 1–2 short sentences, under 22 words total.\n"
+                        "Never place <SEG> mid-thought.\n"
+                        "Never output extremely short segments (under 4 words).\n"
+                        "Your voice output depends on these segments being natural."
+                    )
                 system_msg = (
                     sys_prompt
                     + "\n\nSpeaking style: Respond concisely in 1–3 sentences, like live conversation. "
                       "Prioritize fast, direct answers over long explanations."
-                      "\nFrom now on, output in clean spoken segments.\n"
-                      "Each complete thought MUST end with the token <SEG>.\n"
-                      "Each segment should be 6–14 words.\n"
-                      "Never place <SEG> mid-thought.\n"
-                      "Never output extremely short segments (under 4 words).\n"
-                      "Your voice output depends on these segments being natural."
+                      + seg_rule_text +
                       "\nUse conversational context from earlier turns to stay coherent, concise, and human-like."
                       "\nCognitive pacing rules:\n"
                       "Before producing a segment, think through the idea internally.\n"
                       "Then express the thought clearly in natural spoken language.\n"
                       "Never rush. Never output half-formed ideas.\n"
                       "Each <SEG> should represent one clean, complete thought."
+                      "\nBefore generating each <SEG> segment, internally summarize the user intent and required knowledge in one sentence; do not output this summary."
                 )
 
                 lower = msg.lower()
