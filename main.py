@@ -1,8 +1,4 @@
-# main.py
-# Minimal changes on top of your v5 server to produce more natural TTS:
-# - Optional "natural" mode: wait for full assistant text, optionally punctuate with LLM, then call TTS once
-# - Improved SSML prosody (no mid-sentence comma breaks — only sentence pauses)
-# - Configurable with env NATURAL_SPEECH and PUNCTUATE_WITH_LLM
+# https://github.com/your/repo/blob/main/main.py
 import os
 import json
 import logging
@@ -20,7 +16,6 @@ from openai import AsyncOpenAI
 import websockets
 from asyncio import Queue
 import html
-import re
 
 # =====================================================
 # LOGGING
@@ -38,12 +33,10 @@ NOTION_API_KEY = os.getenv("NOTION_API_KEY", "").strip()
 NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID", "").strip()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 
-# Behavior tuning
+# Feature flags / tuning via env
 USE_SSML = os.getenv("USE_SSML", "1") == "1"
-PUNCTUATE_WITH_LLM = os.getenv("PUNCTUATE_WITH_LLM", "1") == "1"
-NATURAL_SPEECH = os.getenv("NATURAL_SPEECH", "1") == "1"  # if 1 => single TTS for full assistant response (more natural)
-CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "40"))  # still used when NATURAL_SPEECH=0
-# If NATURAL_SPEECH=1 you can increase this to reduce bandwidth for streaming tokens but it won't affect TTS.
+CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "40"))  # lower -> start TTS earlier
+PUNCTUATE_WITH_LLM = os.getenv("PUNCTUATE_WITH_LLM", "0") == "1"
 
 # =====================================================
 # n8n ENDPOINTS
@@ -78,7 +71,7 @@ async def health():
     return {"ok": True}
 
 # =====================================================
-# helpers (mem0, notion, normalization) — keep existing behavior
+# MEM0 HELPERS
 # =====================================================
 async def mem0_search(user_id: str, query: str):
     if not MEMO_API_KEY:
@@ -116,9 +109,13 @@ def memory_context(memories: list) -> str:
             lines.append(f"- {txt}")
     return "Relevant memories:\n" + "\n".join(lines)
 
+# =====================================================
+# NOTION PROMPT
+# =====================================================
 async def get_notion_prompt():
     if not NOTION_PAGE_ID or not NOTION_API_KEY:
         return "You are Solomon Roth’s personal AI assistant, Silas."
+
     url = f"https://api.notion.com/v1/blocks/{NOTION_PAGE_ID}/children"
     headers = {
         "Authorization": f"Bearer {NOTION_API_KEY}",
@@ -144,6 +141,9 @@ async def get_prompt_text():
     txt = await get_notion_prompt()
     return PlainTextResponse(txt, headers={"Access-Control-Allow-Origin": "*"})
 
+# =====================================================
+# NORMALIZATION
+# =====================================================
 def _normalize(m: str):
     m = m.lower().strip()
     m = "".join(ch for ch in m if ch not in string.punctuation)
@@ -153,7 +153,7 @@ def _is_similar(a: str, b: str):
     return bool(a and b and (a == b or a.startswith(b) or b.startswith(a) or a in b or b in a))
 
 # =====================================================
-# SSML & punctuation helpers
+# Utility: prepare TTS input with light SSML
 # =====================================================
 def ensure_sentence_punctuation(s: str) -> str:
     s = s.strip()
@@ -164,49 +164,24 @@ def ensure_sentence_punctuation(s: str) -> str:
     return s
 
 def escape_for_ssml(s: str) -> str:
+    # basic escape for XML
     return html.escape(s, quote=False)
 
 def make_ssml_from_text(text: str) -> str:
-    # Only add pauses at sentence boundaries and mild prosody adjustments
+    # lightweight: ensure punctuation and add short breaks for better prosody
     t = text.strip()
     if not t:
         return t
-    # Ensure sentence endings for SSML pauses
     t = ensure_sentence_punctuation(t)
+    # escape xml chars
     t_esc = escape_for_ssml(t)
-    # Only sentence pauses (no comma pauses to avoid mid-sentence chopping)
-    t_esc = re.sub(r"\.\s+", '.<break time="220ms"/> ', t_esc)
-    # Slightly slower rate for more natural delivery (tweak to taste)
-    return f"<speak><prosody rate='0.98'>{t_esc}</prosody></speak>"
-
-async def punctuate_with_llm(text: str) -> str:
-    # Run a lightweight punctuation pass to improve prosody (final-only)
-    if not PUNCTUATE_WITH_LLM:
-        return text
-    try:
-        resp = await openai_client.chat.completions.create(
-            model=GPT_MODEL,
-            messages=[
-                {"role": "system", "content": "Punctuate this text for spoken TTS output. Do not add new facts. Keep it concise."},
-                {"role": "user", "content": text}
-            ],
-            temperature=0.0,
-            max_tokens=max(3, int(len(text) * 0.6))
-        )
-        punct = resp.choices[0].message["content"].strip()
-        # Minimal cleanup: collapse weird punctuation sequences
-        punct = re.sub(r"\s+([,\.!?])", r"\1", punct)
-        punct = re.sub(r"([,\.!?]){2,}", r"\1", punct)
-        return punct
-    except Exception as e:
-        log.debug(f"Punctuation LLM failed: {e}")
-        return text
+    # add short breaks after periods and commas to improve naturalness
+    t_esc = t_esc.replace(". ", ".<break time=\"220ms\"/> ")
+    t_esc = t_esc.replace(", ", ",<break time=\"70ms\"/> ")
+    return f"<speak>{t_esc}</speak>"
 
 # =====================================================
-# WEBSOCKET HANDLER (based on your v5): single reader, cancellable TTS
-# - If NATURAL_SPEECH=1: wait for full assistant response, run punctuation (if enabled),
-#   then emit a single TTS audio (more natural).
-# - If NATURAL_SPEECH=0: keep prior chunked-TTS streaming behavior for lower latency.
+# WEBSOCKET HANDLER - improved: single receiver + cancellable TTS tasks
 # =====================================================
 @app.websocket("/ws")
 async def websocket_handler(ws: WebSocket):
@@ -216,7 +191,7 @@ async def websocket_handler(ws: WebSocket):
     recent_msgs = []
     processed_messages = set()
 
-    chat_history = []
+    chat_history: List[Dict] = []
     turn_id = 0
     current_active_turn_id = 0
 
@@ -226,14 +201,14 @@ async def websocket_handler(ws: WebSocket):
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
 
-    # GREETING
+    # Greeting
     try:
         log.info("👋 Sending greeting TTS")
-        tts_input = make_ssml_from_text(greet) if USE_SSML else greet
+        greet_input = make_ssml_from_text(greet) if USE_SSML else greet
         tts_greet = await openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
             voice="alloy",
-            input=tts_input
+            input=greet_input
         )
         await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": 0}))
         await ws.send_bytes(await tts_greet.aread())
@@ -265,8 +240,14 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"❌ Failed to connect to Deepgram WS: {e}")
         return
 
-    dg_queue = Queue()
+    # Queues & task tracking
+    incoming_audio_queue: Queue = Queue()   # bytes from client -> DG sender
+    dg_transcript_queue: Queue = Queue()   # transcripts from DG listener -> transcript_processor
+    tts_tasks_by_turn: Dict[int, Set[asyncio.Task]] = {}
 
+    last_audio_time = time.time()
+
+    # -- Deepgram listener (as before) pushes transcripts into dg_transcript_queue
     async def deepgram_listener_task():
         try:
             async for raw in dg_ws:
@@ -296,7 +277,7 @@ async def websocket_handler(ws: WebSocket):
 
                     if transcript:
                         log.info(f"🧠 Deepgram partial/final transcript: {transcript}")
-                        await dg_queue.put(transcript)
+                        await dg_transcript_queue.put(transcript)
 
                 except Exception as e:
                     log.error(f"❌ DG parse error: {e}")
@@ -304,8 +285,6 @@ async def websocket_handler(ws: WebSocket):
             log.error(f"❌ DG listener fatal: {e}")
 
     asyncio.create_task(deepgram_listener_task())
-
-    last_audio_time = time.time()
 
     async def dg_keepalive_task():
         nonlocal last_audio_time
@@ -325,45 +304,161 @@ async def websocket_handler(ws: WebSocket):
 
     keepalive_task = asyncio.create_task(dg_keepalive_task())
 
-    # Light single-reader for interrupts (client already sends them); we expect this pattern from v5
-    async def ws_text_listener():
-        nonlocal turn_id, current_active_turn_id
+    # -----------------------------------------------------
+    # Reader loop: single consumer of ws.receive() to handle both text and bytes
+    # -----------------------------------------------------
+    async def ws_reader():
+        nonlocal last_audio_time, turn_id, current_active_turn_id
         try:
             while True:
-                try:
-                    msg = await ws.receive_text()
-                except WebSocketDisconnect:
+                msg = await ws.receive()
+                if msg is None:
                     break
-                except Exception as e:
-                    # small sleep and retry
-                    await asyncio.sleep(0.05)
-                    continue
+
+                mtype = msg.get("type")
+
+                if mtype == "websocket.receive":
+                    if "text" in msg and msg["text"] is not None:
+                        try:
+                            data = json.loads(msg["text"])
+                        except Exception:
+                            continue
+                        typ = data.get("type")
+                        if typ == "interrupt":
+                            # immediate interrupt: bump active turn and cancel outstanding TTS tasks
+                            turn_id += 1
+                            current_active_turn_id = turn_id
+                            log.info(f"⏹️ Received interrupt from client — new active turn {current_active_turn_id}")
+                            # cancel all outstanding tts tasks for older turns
+                            for t_id, tasks in list(tts_tasks_by_turn.items()):
+                                if t_id != current_active_turn_id:
+                                    for t in tasks:
+                                        try:
+                                            t.cancel()
+                                        except Exception:
+                                            pass
+                                    tts_tasks_by_turn.pop(t_id, None)
+                        else:
+                            # other text messages can be logged
+                            log.debug(f"WS text message (ignored): {data}")
+                    elif "bytes" in msg and msg["bytes"] is not None:
+                        audio_bytes = msg["bytes"]
+                        # audio_bytes are forwarded to DG sender via queue
+                        await incoming_audio_queue.put(audio_bytes)
+                        last_audio_time = time.time()
+                    else:
+                        # ignore other forms
+                        pass
+                elif mtype == "websocket.disconnect":
+                    log.info("WS reader noticed disconnect")
+                    break
+        except WebSocketDisconnect:
+            log.info("WS reader disconnected")
+        except Exception as e:
+            log.error(f"ws_reader fatal: {e}")
+
+    reader_task = asyncio.create_task(ws_reader())
+
+    # -----------------------------------------------------
+    # DG audio sender: serializes sending bytes to Deepgram
+    # -----------------------------------------------------
+    async def dg_audio_sender():
+        try:
+            while True:
+                data = await incoming_audio_queue.get()
+                if data is None:
+                    break
                 try:
-                    data = json.loads(msg)
-                except Exception:
-                    continue
-                typ = data.get("type")
-                if typ == "interrupt":
-                    turn_id += 1
-                    current_active_turn_id = turn_id
-                    log.info(f"⏹️ Received interrupt from client — new active turn {current_active_turn_id}")
+                    if len(data) % 2 != 0:
+                        data = data + b"\x00"
+                    await dg_ws.send(data)
+                except Exception as e:
+                    log.error(f"❌ Error sending audio to Deepgram WS: {e}")
         except asyncio.CancelledError:
             return
+
+    dg_sender_task = asyncio.create_task(dg_audio_sender())
+
+    # -----------------------------------------------------
+    # Helper: spawn a TTS generation-and-send task (non-blocking)
+    # Each task checks turn validity before sending. Tasks are cancellable.
+    # -----------------------------------------------------
+    async def _tts_and_send(tts_text: str, t_turn: int):
+        # prepare payload
+        try:
+            if PUNCTUATE_WITH_LLM:
+                try:
+                    punct_resp = await openai_client.chat.completions.create(
+                        model=GPT_MODEL,
+                        messages=[
+                            {"role": "system", "content": "Punctuate and improve this text for natural spoken TTS output."},
+                            {"role": "user", "content": tts_text}
+                        ],
+                        temperature=0,
+                        max_tokens=max(3, int(len(tts_text) * 0.6))
+                    )
+                    punct_text = punct_resp.choices[0].message["content"].strip()
+                    tts_payload = make_ssml_from_text(punct_text) if USE_SSML else punct_text
+                except Exception as e:
+                    log.debug(f"Punctuation LLM failed: {e}")
+                    tts_payload = make_ssml_from_text(tts_text) if USE_SSML else tts_text
+            else:
+                tts_payload = make_ssml_from_text(tts_text) if USE_SSML else tts_text
+
+            # early bail-out if turn changed
+            if t_turn != current_active_turn_id:
+                log.info(f"🔁 TTS task for turn {t_turn} cancelled before create (active={current_active_turn_id})")
+                return
+
+            tts = await openai_client.audio.speech.create(
+                model="gpt-4o-mini-tts",
+                voice="alloy",
+                input=tts_payload
+            )
+
+            # double-check again before sending audio bytes
+            if t_turn != current_active_turn_id:
+                log.info(f"🔁 TTS task for turn {t_turn} cancelled after generation (active={current_active_turn_id})")
+                return
+
+            # notify client metadata for upcoming binary frame(s)
+            try:
+                await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": t_turn}))
+            except Exception:
+                pass
+
+            # stream the audio bytes (aread returns bytes)
+            audio_bytes = await tts.aread()
+            if t_turn != current_active_turn_id:
+                log.info(f"🔁 TTS task for turn {t_turn} cancelled after aread (active={current_active_turn_id})")
+                return
+
+            try:
+                await ws.send_bytes(audio_bytes)
+                log.info(f"🎙️ TTS SENT for turn={t_turn}, len={len(audio_bytes)}")
+            except Exception as e:
+                log.error(f"Failed to send TTS bytes for turn {t_turn}: {e}")
+
+        except asyncio.CancelledError:
+            log.info(f"🔁 TTS task for turn {t_turn} cancelled (task cancelled).")
+            return
         except Exception as e:
-            log.error(f"ws_text_listener fatal: {e}")
+            log.error(f"❌ TTS task error for turn {t_turn}: {e}")
 
-    text_task = asyncio.create_task(ws_text_listener())
-
-    # TRANSCRIPT PROCESSOR
+    # -----------------------------------------------------
+    # Transcript processor: consumes transcripts found by DG listener
+    # Produces LLM completion (streaming) and spawns TTS tasks concurrently.
+    # -----------------------------------------------------
     async def transcript_processor():
-        nonlocal last_audio_time, turn_id, current_active_turn_id, chat_history, recent_msgs, processed_messages
+        nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id, current_active_turn_id, chat_history
         try:
             while True:
-                transcript = await dg_queue.get()
-                if not transcript:
-                    continue
+                transcript = await dg_transcript_queue.get()
+                if transcript is None:
+                    break
 
-                if len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
+                if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
+                    log.info("⏭ Ignoring very short / non-alpha transcript")
                     continue
 
                 msg = transcript
@@ -371,13 +466,14 @@ async def websocket_handler(ws: WebSocket):
                 now = time.time()
                 recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
                 if any(_is_similar(m, norm) for (m, t) in recent_msgs):
+                    log.info(f"⏭ Skipping near-duplicate transcript: '{msg}'")
                     continue
                 recent_msgs.append((norm, now))
 
-                # user turn recorded
+                # record user in history
                 chat_history.append({"role": "user", "content": msg})
 
-                # new turn id
+                # new turn
                 turn_id += 1
                 current_turn = turn_id
                 current_active_turn_id = current_turn
@@ -394,45 +490,34 @@ async def websocket_handler(ws: WebSocket):
 
                 lower = msg.lower()
 
-                # plate / calendar shortcuts (unchanged)
+                # Plate logic
                 if any(k in lower for k in plate_kw):
                     if msg in processed_messages:
+                        log.info(f"⏭ Plate msg already processed: '{msg}'")
                         continue
                     processed_messages.add(msg)
                     reply = await send_to_n8n(N8N_PLATE_URL, msg)
                     if current_turn != current_active_turn_id:
+                        log.info(f"🔁 Plate turn {current_turn} abandoned (active={current_active_turn_id})")
                         continue
-                    try:
-                        tts_payload = make_ssml_from_text(reply) if USE_SSML else reply
-                        tts = await openai_client.audio.speech.create(
-                            model="gpt-4o-mini-tts",
-                            voice="alloy",
-                            input=tts_payload
-                        )
-                        await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
-                        await ws.send_bytes(await tts.aread())
-                    except Exception as e:
-                        log.error(f"❌ Plate TTS error: {e}")
+                    t_task = asyncio.create_task(_tts_and_send(reply, current_turn))
+                    tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
+                    # cleanup finished tasks in background
+                    t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
                     continue
 
+                # Calendar logic
                 if any(k in lower for k in calendar_kw):
                     reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
                     if current_turn != current_active_turn_id:
+                        log.info(f"🔁 Calendar turn {current_turn} abandoned (active={current_active_turn_id})")
                         continue
-                    try:
-                        tts_payload = make_ssml_from_text(reply) if USE_SSML else reply
-                        tts = await openai_client.audio.speech.create(
-                            model="gpt-4o-mini-tts",
-                            voice="alloy",
-                            input=tts_payload
-                        )
-                        await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
-                        await ws.send_bytes(await tts.aread())
-                    except Exception as e:
-                        log.error(f"❌ Calendar TTS error: {e}")
+                    t_task = asyncio.create_task(_tts_and_send(reply, current_turn))
+                    tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
+                    t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
                     continue
 
-                # GENERAL GPT streaming
+                # General GPT streaming -> spawn non-blocking TTS for chunks
                 try:
                     messages = [{"role": "system", "content": system_msg}] + chat_history
                     log.info(f"🤖 GPT START turn={current_turn}, active={current_active_turn_id}, messages_len={len(messages)}")
@@ -450,86 +535,37 @@ async def websocket_handler(ws: WebSocket):
                         if current_turn != current_active_turn_id:
                             log.info(f"🔁 CANCEL STREAM turn={current_turn}, active={current_active_turn_id}")
                             break
+
                         delta = getattr(chunk.choices[0].delta, "content", "")
                         if not delta:
                             continue
+
                         assistant_full_text += delta
                         buffer += delta
 
-                        # If NATURAL_SPEECH is disabled, keep old behavior: generate TTS for chunks
-                        if not NATURAL_SPEECH:
-                            if len(buffer) >= CHUNK_CHAR_THRESHOLD:
-                                if current_turn != current_active_turn_id:
-                                    break
-                                try:
-                                    log.info(f"🎙️ TTS CHUNK START turn={current_turn}, len={len(buffer)}")
-                                    tts_payload = make_ssml_from_text(buffer) if USE_SSML else buffer
-                                    tts = await openai_client.audio.speech.create(
-                                        model="gpt-4o-mini-tts",
-                                        voice="alloy",
-                                        input=tts_payload
-                                    )
-                                    if current_turn != current_active_turn_id:
-                                        break
-                                    await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
-                                    await ws.send_bytes(await tts.aread())
-                                    log.info(f"🎙️ TTS CHUNK SENT turn={current_turn}")
-                                except Exception as e:
-                                    log.error(f"❌ TTS stream-chunk error: {e}")
-                                buffer = ""
-                        else:
-                            # NATURAL_SPEECH=1: we intentionally do NOT emit TTS for intermediate chunks.
-                            # This keeps intermediate audio from breaking sentence flow.
-                            # Continue collecting assistant_full_text until stream completes.
-                            pass
+                        if len(buffer) >= CHUNK_CHAR_THRESHOLD:
+                            if current_turn != current_active_turn_id:
+                                log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
+                                break
 
-                    # After streaming ends: handle final output
-                    if current_turn == current_active_turn_id:
-                        final_text = assistant_full_text.strip()
-                        if final_text:
-                            # Option A: NATURAL_SPEECH=1 -> do one TTS for the whole final_text (best naturalness)
-                            if NATURAL_SPEECH:
-                                try:
-                                    # optional punctuation pass
-                                    if PUNCTUATE_WITH_LLM:
-                                        try:
-                                            final_text = await punctuate_with_llm(final_text)
-                                        except Exception as e:
-                                            log.debug(f"Punctuate final failed: {e}")
+                            # spawn tts task; do not block the token stream
+                            chunk_text = buffer
+                            buffer = ""
+                            t_task = asyncio.create_task(_tts_and_send(chunk_text, current_turn))
+                            tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
+                            # ensure we remove finished tasks later
+                            t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
 
-                                    tts_payload = make_ssml_from_text(final_text) if USE_SSML else final_text
-                                    log.info(f"🎙️ TTS FINAL START turn={current_turn}, len={len(final_text)}")
-                                    tts = await openai_client.audio.speech.create(
-                                        model="gpt-4o-mini-tts",
-                                        voice="alloy",
-                                        input=tts_payload
-                                    )
-                                    # check again after generation
-                                    if current_turn == current_active_turn_id:
-                                        await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
-                                        await ws.send_bytes(await tts.aread())
-                                        log.info(f"🎙️ TTS FINAL SENT turn={current_turn}")
-                                except Exception as e:
-                                    log.error(f"❌ TTS final-chunk error: {e}")
-                            else:
-                                # NATURAL_SPEECH=0: we may have leftover buffer from stream; emit it
-                                if buffer.strip():
-                                    try:
-                                        tts_payload = make_ssml_from_text(buffer) if USE_SSML else buffer
-                                        tts = await openai_client.audio.speech.create(
-                                            model="gpt-4o-mini-tts",
-                                            voice="alloy",
-                                            input=tts_payload
-                                        )
-                                        if current_turn == current_active_turn_id:
-                                            await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": current_turn}))
-                                            await ws.send_bytes(await tts.aread())
-                                    except Exception as e:
-                                        log.error(f"❌ TTS final-chunk error (non-natural): {e}")
+                    # final buffer
+                    if buffer.strip() and current_turn == current_active_turn_id:
+                        t_task = asyncio.create_task(_tts_and_send(buffer, current_turn))
+                        tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
+                        t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
 
-                            # store assistant in history (for context)
-                            chat_history.append({"role": "assistant", "content": final_text})
-                            log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)})")
+                    # add assistant to history only if still active
+                    if assistant_full_text.strip() and current_turn == current_active_turn_id:
+                        chat_history.append({"role": "assistant", "content": assistant_full_text.strip()})
+                        log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)})")
 
                     asyncio.create_task(mem0_add(user_id, msg))
 
@@ -541,61 +577,42 @@ async def websocket_handler(ws: WebSocket):
 
     transcript_task = asyncio.create_task(transcript_processor())
 
-    # MAIN LOOP — browser audio -> Deepgram (unchanged)
+    # -----------------------------------------------------
+    # Cleanup & shutdown handling
+    # -----------------------------------------------------
     try:
-        while True:
-            try:
-                audio_bytes = await ws.receive_bytes()
-            except WebSocketDisconnect:
-                log.info("Browser websocket disconnected")
-                break
-            except Exception as e:
-                log.error(f"WebSocket receive error: {e}")
-                await asyncio.sleep(0.05)
-                continue
-
-            if not audio_bytes:
-                continue
-
-            if len(audio_bytes) % 2 != 0:
-                audio_bytes = audio_bytes + b"\x00"
-
-            last_audio_time = time.time()
-
-            try:
-                import struct as _struct
-                if len(audio_bytes) >= 20:
-                    samples = _struct.unpack("<10h", audio_bytes[:20])
-                    log.info(f"PCM samples[0:10] = {list(samples)}")
-            except Exception as e:
-                log.error(f"sample unpack error: {e}")
-
-            log.info(f"📡 PCM audio received — {len(audio_bytes)} bytes")
-
-            try:
-                await dg_ws.send(audio_bytes)
-            except Exception as e:
-                log.error(f"❌ Error sending audio to Deepgram WS: {e}")
-                continue
-
-    except WebSocketDisconnect:
+        # wait for reader to finish (client disconnect) — other tasks run independently
+        await reader_task
+    except Exception:
         pass
     finally:
+        # cancel tasks/close connections
         try:
-            keepalive_task.cancel()
-        except:
+            reader_task.cancel()
+        except Exception:
+            pass
+        try:
+            dg_sender_task.cancel()
+        except Exception:
             pass
         try:
             transcript_task.cancel()
-        except:
+        except Exception:
             pass
         try:
-            text_task.cancel()
-        except:
+            keepalive_task.cancel()
+        except Exception:
             pass
+        # cancel outstanding TTS tasks
+        for tasks in tts_tasks_by_turn.values():
+            for t in tasks:
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
         try:
             await dg_ws.close()
-        except:
+        except Exception:
             pass
 
 # =====================================================
