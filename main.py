@@ -1,4 +1,4 @@
-]# main.py
+# main.py
 # Improved TTS prosody and server-side concatenation of TTS chunks to remove gaps
 import os
 import json
