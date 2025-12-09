@@ -329,6 +329,7 @@ async def websocket_handler(ws: WebSocket):
                             log.debug(f"WS text message (ignored): {data}")
                     elif "bytes" in msg and msg["bytes"] is not None:
                         audio_bytes = msg["bytes"]
+                        log.info(f"🎤 Received audio frame from client, len={len(audio_bytes)} bytes")
                         await incoming_audio_queue.put(audio_bytes)
                         last_audio_time = time.time()
                     else:
@@ -357,6 +358,7 @@ async def websocket_handler(ws: WebSocket):
                     if len(data) % 2 != 0:
                         data = data + b"\x00"
                     audio_b64 = base64.b64encode(data).decode("utf-8")
+                    log.info(f"↗️ Sending audio to Realtime: len={len(data)} bytes")
                     await rt_ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio_b64}))
                     await rt_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                     await rt_ws.send(json.dumps({"type": "response.create", "response": {}}))
