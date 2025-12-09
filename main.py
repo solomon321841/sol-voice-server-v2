@@ -47,8 +47,8 @@ MAX_PROSODY_RATE = float(os.getenv("MAX_PROSODY_RATE", "1.55"))
 MOMENTUM_ALPHA = float(os.getenv("MOMENTUM_ALPHA", "0.15"))
 
 # Finalization tuning
-FINAL_SILENCE_SEC = float(os.getenv("FINAL_SILENCE_SEC", "0.60"))
-MIN_FINAL_WORDS = int(os.getenv("MIN_FINAL_WORDS", "5"))
+FINAL_SILENCE_SEC = float(os.getenv("FINAL_SILENCE_SEC", "0.80"))
+MIN_FINAL_WORDS = int(os.getenv("MIN_FINAL_WORDS", "6"))
 
 # =====================================================
 # n8n ENDPOINTS
@@ -256,7 +256,7 @@ async def websocket_handler(ws: WebSocket):
     turn_id = 0
     current_active_turn_id = 0
     calendar_kw = ["calendar", "meeting", "schedule", "appointment"]
-    plate_kw = ["plate", "task", "to-do", "notion", "list"]
+    plate_kw = ["plate", "add", "to-do", "task", "notion", "list"]
 
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
@@ -371,26 +371,37 @@ async def websocket_handler(ws: WebSocket):
                             data = json.loads(msg["text"])
                         except Exception:
                             continue
-                        if data.get("type") == "interrupt":
+                        typ = data.get("type")
+                        if typ == "interrupt":
+                            # immediate interrupt: bump active turn and cancel outstanding TTS tasks
                             turn_id += 1
                             current_active_turn_id = turn_id
-                            log.info(f"⏹️ interrupt -> active turn {current_active_turn_id}")
-                            # cancel old tts tasks
+                            log.info(f"⏹️ Received interrupt from client — new active turn {current_active_turn_id}")
+                            # cancel all outstanding tts tasks for older turns
                             for t_id, tasks in list(tts_tasks_by_turn.items()):
                                 if t_id != current_active_turn_id:
                                     for t in tasks:
                                         try:
                                             t.cancel()
-                                        except:
+                                        except Exception:
                                             pass
                                     tts_tasks_by_turn.pop(t_id, None)
+                        else:
+                            # other text messages can be logged
+                            log.debug(f"WS text message (ignored): {data}")
                     elif "bytes" in msg and msg["bytes"] is not None:
-                        await incoming_audio_queue.put(msg["bytes"])
+                        audio_bytes = msg["bytes"]
+                        # audio_bytes are forwarded to DG sender via queue
+                        await incoming_audio_queue.put(audio_bytes)
                         last_audio_time = time.time()
+                    else:
+                        # ignore other forms
+                        pass
                 elif mtype == "websocket.disconnect":
+                    log.info("WS reader noticed disconnect")
                     break
         except WebSocketDisconnect:
-            pass
+            log.info("WS reader disconnected")
         except Exception as e:
             log.error(f"ws_reader fatal: {e}")
 
@@ -562,19 +573,13 @@ async def websocket_handler(ws: WebSocket):
 
                 lower = msg.lower()
 
-                # Plate logic (only after final transcript)
+                # Plate logic
                 if any(k in lower for k in plate_kw):
-                    if _normalize(msg) in processed_messages:
+                    if msg in processed_messages:
                         log.info(f"⏭ Plate msg already processed: '{msg}'")
                         continue
-                    processed_messages.add(_normalize(msg))
-
-                    # Secondary operation check
-                    is_add_operation = ("add" in lower or "put" in lower or "create" in lower)
-                    log.debug(f"Plate intent detected. is_add_operation={is_add_operation}")
-
+                    processed_messages.add(msg)
                     reply = await send_to_n8n(N8N_PLATE_URL, msg)
-                    log.info(f"➡️ SENT TO N8N (plate): {msg!r}")
                     if current_turn != current_active_turn_id:
                         log.info(f"🔁 Plate turn {current_turn} abandoned (active={current_active_turn_id})")
                         continue
@@ -587,7 +592,6 @@ async def websocket_handler(ws: WebSocket):
                 # Calendar logic
                 if any(k in lower for k in calendar_kw):
                     reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
-                    log.info(f"➡️ SENT TO N8N (calendar): {msg!r}")
                     if current_turn != current_active_turn_id:
                         log.info(f"🔁 Calendar turn {current_turn} abandoned (active={current_active_turn_id})")
                         continue
