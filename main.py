@@ -163,7 +163,7 @@ def make_ssml_from_text(text: str) -> str:
     if not t:
         return t
     t_esc = escape_for_ssml(t)
-    return f"<speak>{t_esc}</speak>"
+    return f'<speak><prosody rate="1.30">{t_esc}</prosody></speak>'
 
 # =====================================================
 # WEBSOCKET HANDLER - improved: single receiver + cancellable TTS tasks
@@ -313,12 +313,6 @@ async def websocket_handler(ws: WebSocket):
                             # immediate interrupt: bump active turn and cancel outstanding TTS tasks
                             turn_id += 1
                             current_active_turn_id = turn_id
-                            # flush Deepgram transcript queue
-                            try:
-                                while True:
-                                    dg_transcript_queue.get_nowait()
-                            except asyncio.QueueEmpty:
-                                pass
                             log.info(f"⏹️ Received interrupt from client — new active turn {current_active_turn_id}")
                             # cancel all outstanding tts tasks for older turns
                             for t_id, tasks in list(tts_tasks_by_turn.items()):
@@ -481,10 +475,18 @@ async def websocket_handler(ws: WebSocket):
                     sys_prompt
                     + "\n\nSpeaking style: Respond concisely in 1–3 sentences, like live conversation. "
                       "Prioritize fast, direct answers over long explanations."
-                    + "\nFrom now on, emit your response in semantic segments. "
-                      "Each complete thought should end with the special token <SEG>. "
-                      "Do NOT put <SEG> mid-thought. "
-                      "A segment is typically 3–12 words and should reflect a natural spoken phrase."
+                      "\nFrom now on, output in clean spoken segments.\n"
+                      "Each complete thought MUST end with the token <SEG>.\n"
+                      "Each segment should be 6–14 words.\n"
+                      "Never place <SEG> mid-thought.\n"
+                      "Never output extremely short segments (under 4 words).\n"
+                      "Your voice output depends on these segments being natural."
+                      "\nUse conversational context from earlier turns to stay coherent, concise, and human-like."
+                      "\nCognitive pacing rules:\n"
+                      "Before producing a segment, think through the idea internally.\n"
+                      "Then express the thought clearly in natural spoken language.\n"
+                      "Never rush. Never output half-formed ideas.\n"
+                      "Each <SEG> should represent one clean, complete thought."
                 )
 
                 lower = msg.lower()
