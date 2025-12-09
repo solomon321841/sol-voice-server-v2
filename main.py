@@ -47,8 +47,8 @@ MAX_PROSODY_RATE = float(os.getenv("MAX_PROSODY_RATE", "1.55"))
 MOMENTUM_ALPHA = float(os.getenv("MOMENTUM_ALPHA", "0.15"))
 
 # Finalization tuning
-FINAL_SILENCE_SEC = float(os.getenv("FINAL_SILENCE_SEC", "0.80"))
-MIN_FINAL_WORDS = int(os.getenv("MIN_FINAL_WORDS", "6"))
+FINAL_SILENCE_SEC = float(os.getenv("FINAL_SILENCE_SEC", "0.65"))
+MIN_FINAL_WORDS = int(os.getenv("MIN_FINAL_WORDS", "3"))
 
 # =====================================================
 # n8n ENDPOINTS
@@ -504,6 +504,7 @@ async def websocket_handler(ws: WebSocket):
     # -----------------------------------------------------
     # Transcript processor: consumes transcripts found by DG listener
     # Produces LLM completion (streaming) and spawns TTS tasks concurrently.
+    # Ensures only final (whole) transcripts are sent to n8n.
     # -----------------------------------------------------
     def _ready_to_speak(buf: str) -> bool:
         # Speak when the model finishes a thought OR the buffer gets long
@@ -511,28 +512,45 @@ async def websocket_handler(ws: WebSocket):
 
     async def transcript_processor():
         nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id, current_active_turn_id, chat_history
+        pending_transcript = ""
+        last_update_ts = 0.0
+
         try:
             while True:
                 transcript = await dg_transcript_queue.get()
                 if transcript is None:
                     break
 
+                # Ignore extremely short / non-alpha
                 if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
                     log.info("⏭ Ignoring very short / non-alpha transcript")
                     continue
 
-                # Wait briefly to see if more transcript arrives (finalization gate)
+                # Keep only the most recent transcript; drain any queued partials
+                pending_transcript = transcript
+                last_update_ts = time.time()
+                while not dg_transcript_queue.empty():
+                    maybe_more = dg_transcript_queue.get_nowait()
+                    if maybe_more:
+                        pending_transcript = maybe_more
+                        last_update_ts = time.time()
+
+                # Wait for silence window
                 await asyncio.sleep(FINAL_SILENCE_SEC)
-                if not dg_transcript_queue.empty():
+
+                # If new audio arrived during the wait, keep collecting
+                if time.time() - last_update_ts < FINAL_SILENCE_SEC:
                     log.info("⏳ More transcript pending; waiting for final input")
                     continue
 
-                # Only proceed if the transcript looks final or has enough words
-                if not _looks_final(transcript):
+                # Only proceed once we have what looks like a final, whole sentence
+                if not _looks_final(pending_transcript):
                     log.info("⏭ Transcript does not look final yet; skipping this turn")
                     continue
 
-                msg = transcript
+                msg = pending_transcript
+                pending_transcript = ""
+
                 norm = _normalize(msg)
                 now = time.time()
                 recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
@@ -585,7 +603,6 @@ async def websocket_handler(ws: WebSocket):
                         continue
                     t_task = asyncio.create_task(_tts_and_send(reply, current_turn))
                     tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
-                    # cleanup finished tasks in background
                     t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
                     continue
 
@@ -641,7 +658,6 @@ async def websocket_handler(ws: WebSocket):
                             await asyncio.sleep(COGNITIVE_PACING_MS / 1000.0)
                             t_task = asyncio.create_task(_tts_and_send(chunk_text, current_turn))
                             tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
-                            # ensure we remove finished tasks later
                             t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
 
                     # final buffer
