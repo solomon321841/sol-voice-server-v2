@@ -536,7 +536,7 @@ async def websocket_handler(ws: WebSocket):
                     t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
                     continue
 
-                # General GPT streaming -> spawn non-blocking TTS for each token immediately
+                # General GPT streaming -> spawn non-blocking TTS with micro-chunks
                 try:
                     history_tail = chat_history[-3:]
                     messages = [{"role": "system", "content": system_msg_static}]
@@ -552,6 +552,7 @@ async def websocket_handler(ws: WebSocket):
                     )
 
                     assistant_full_text = ""
+                    buffer = ""
 
                     async for chunk in stream:
                         if current_turn != current_active_turn_id:
@@ -561,10 +562,19 @@ async def websocket_handler(ws: WebSocket):
                         if not delta:
                             continue
                         assistant_full_text += delta
+                        buffer += delta
                         if current_turn != current_active_turn_id:
                             log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
                             break
-                        t_task = asyncio.create_task(_tts_and_send(delta, current_turn))
+                        if len(buffer) >= 22 or buffer.endswith(('.', '?', '!', ',')):
+                            chunk_text = buffer
+                            buffer = ""
+                            t_task = asyncio.create_task(_tts_and_send(chunk_text, current_turn))
+                            tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
+                            t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
+
+                    if buffer.strip() and current_turn == current_active_turn_id:
+                        t_task = asyncio.create_task(_tts_and_send(buffer, current_turn))
                         tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
                         t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
 
