@@ -288,7 +288,7 @@ async def websocket_handler(ws: WebSocket):
 
     # Reader loop
     async def ws_reader():
-        nonlocal last_audio_time, turn_id, current_active_turn_id
+        nonlocal last_audio_time, turn_id, current_active_turn_id, audio_accum
         try:
             while True:
                 msg = await ws.receive()
@@ -305,6 +305,7 @@ async def websocket_handler(ws: WebSocket):
                         if typ == "interrupt":
                             turn_id += 1
                             current_active_turn_id = turn_id
+                            audio_accum.clear()
                             log.info(f"⏹️ Received interrupt from client — new active turn {current_active_turn_id}")
                             for t_id, tasks in list(tts_tasks_by_turn.items()):
                                 if t_id != current_active_turn_id:
@@ -331,18 +332,24 @@ async def websocket_handler(ws: WebSocket):
 
     reader_task = asyncio.create_task(ws_reader())
 
-    # Audio sender
+    # Audio sender with 100ms minimum buffer per commit
+    min_bytes_per_commit = int(48000 * 2 * 0.10)  # 100ms of 48k PCM16 mono = 9600 bytes
+    audio_accum = bytearray()
+
     async def realtime_audio_sender():
         try:
             while True:
                 data = await incoming_audio_queue.get()
                 if data is None:
                     break
+                audio_accum.extend(data)
+                if len(audio_accum) < min_bytes_per_commit:
+                    continue
                 try:
-                    if len(data) % 2 != 0:
-                        data = data + b"\x00"
-                    audio_b64 = base64.b64encode(data).decode("utf-8")
-                    log.info(f"↗️ Sending audio to Realtime: len={len(data)} bytes")
+                    chunk = bytes(audio_accum)
+                    audio_accum.clear()
+                    audio_b64 = base64.b64encode(chunk).decode("utf-8")
+                    log.info(f"↗️ Sending audio to Realtime: len={len(chunk)} bytes")
                     await rt_ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio_b64}))
                     await rt_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                     await rt_ws.send(json.dumps({"type": "response.create", "response": {}}))
