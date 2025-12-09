@@ -288,7 +288,7 @@ async def websocket_handler(ws: WebSocket):
 
     # Reader loop
     async def ws_reader():
-        nonlocal last_audio_time, turn_id, current_active_turn_id, audio_accum
+        nonlocal last_audio_time, turn_id, current_active_turn_id, audio_accum, last_commit_ts
         try:
             while True:
                 msg = await ws.receive()
@@ -332,20 +332,31 @@ async def websocket_handler(ws: WebSocket):
 
     reader_task = asyncio.create_task(ws_reader())
 
-    # Audio sender with 100ms minimum buffer per commit
+    # Audio sender with min-bytes AND max-wait guard
     min_bytes_per_commit = int(48000 * 2 * 0.10)  # 100ms of 48k PCM16 mono = 9600 bytes
+    max_wait_seconds = 0.25  # flush whatever we have every 250ms if non-empty
     audio_accum = bytearray()
+    last_commit_ts = time.time()
 
     async def realtime_audio_sender():
+        nonlocal last_commit_ts
         try:
             while True:
                 data = await incoming_audio_queue.get()
                 if data is None:
                     break
                 audio_accum.extend(data)
-                if len(audio_accum) < min_bytes_per_commit:
+
+                now = time.time()
+                should_flush = len(audio_accum) >= min_bytes_per_commit or (
+                    len(audio_accum) > 0 and (now - last_commit_ts) >= max_wait_seconds
+                )
+                if not should_flush:
                     continue
+
                 try:
+                    if len(audio_accum) == 0:
+                        continue
                     chunk = bytes(audio_accum)
                     audio_accum.clear()
                     audio_b64 = base64.b64encode(chunk).decode("utf-8")
@@ -353,6 +364,7 @@ async def websocket_handler(ws: WebSocket):
                     await rt_ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio_b64}))
                     await rt_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                     await rt_ws.send(json.dumps({"type": "response.create", "response": {}}))
+                    last_commit_ts = now
                 except Exception as e:
                     log.error(f"❌ Error sending audio to Realtime WS: {e}")
         except asyncio.CancelledError:
