@@ -4,6 +4,7 @@ import logging
 import asyncio
 import time
 import string
+import base64
 from typing import List, Dict, Set
 from dotenv import load_dotenv
 import httpx
@@ -13,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from openai import AsyncOpenAI
 import websockets
-from asyncio import Queue
+from asyncio import Queue, QueueEmpty
 import html
 
 # =====================================================
@@ -30,11 +31,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 MEMO_API_KEY = os.getenv("MEMO_API_KEY", "").strip()
 NOTION_API_KEY = os.getenv("NOTION_API_KEY", "").strip()
 NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID", "").strip()
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()  # kept for compatibility, unused now
+FAST_MODE = os.getenv("FAST_MODE", "0") == "1"
 
 # Feature flags / tuning via env
 USE_SSML = os.getenv("USE_SSML", "1") == "1"
-CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "40"))  # lower -> start TTS earlier
+CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "20"))  # lower -> start TTS earlier
 PUNCTUATE_WITH_LLM = os.getenv("PUNCTUATE_WITH_LLM", "0") == "1"
 
 # =====================================================
@@ -73,9 +75,11 @@ async def health():
 # MEM0 HELPERS
 # =====================================================
 async def mem0_search(user_id: str, query: str):
+    if FAST_MODE:
+        return []
     if not MEMO_API_KEY:
         return []
-    headers = {"Authorization": f"Token MEMO_API_KEY"}
+    headers = {"Authorization": f"Token {MEMO_API_KEY}"}
     payload = {"filters": {"user_id": user_id}, "query": query}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
@@ -200,42 +204,41 @@ async def websocket_handler(ws: WebSocket):
     except Exception as e:
         log.error(f"❌ Greeting TTS error: {e}")
 
-    if not DEEPGRAM_API_KEY:
-        log.error("❌ No DEEPGRAM_API_KEY set.")
+    if not OPENAI_API_KEY:
+        log.error("❌ No OPENAI_API_KEY set.")
         return
 
-    dg_url = (
-        "wss://api.deepgram.com/v1/listen"
-        "?model=nova-2"
-        "&encoding=linear16"
-        "&sample_rate=48000"
-    )
+    rt_url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17"
 
     try:
-        log.info("🌐 Connecting to Deepgram...")
-        dg_ws = await websockets.connect(
-            dg_url,
-            additional_headers=[("Authorization", f"Token {DEEPGRAM_API_KEY}")],
+        log.info("🌐 Connecting to OpenAI Realtime...")
+        rt_ws = await websockets.connect(
+            rt_url,
+            additional_headers=[
+                ("Authorization", f"Bearer {OPENAI_API_KEY}"),
+                ("OpenAI-Beta", "realtime=v1")
+            ],
             ping_interval=None,
             max_size=None,
             close_timeout=0
         )
-        log.info("✅ Connected to Deepgram")
+        await rt_ws.send(json.dumps({"type": "response.create", "response": {}}))
+        log.info("✅ Connected to OpenAI Realtime")
     except Exception as e:
-        log.error(f"❌ Failed to connect to Deepgram WS: {e}")
+        log.error(f"❌ Failed to connect to OpenAI Realtime WS: {e}")
         return
 
     # Queues & task tracking
-    incoming_audio_queue: Queue = Queue()   # bytes from client -> DG sender
-    dg_transcript_queue: Queue = Queue()   # transcripts from DG listener -> transcript_processor
+    incoming_audio_queue: Queue = Queue()   # bytes from client -> OA sender
+    dg_transcript_queue: Queue = Queue()   # transcripts from OA listener -> transcript_processor
     tts_tasks_by_turn: Dict[int, Set[asyncio.Task]] = {}
 
     last_audio_time = time.time()
 
-    # -- Deepgram listener (as before) pushes transcripts into dg_transcript_queue
-    async def deepgram_listener_task():
+    # -- OpenAI Realtime listener pushes transcripts into dg_transcript_queue
+    async def realtime_listener_task():
         try:
-            async for raw in dg_ws:
+            async for raw in rt_ws:
                 try:
                     if isinstance(raw, (bytes, bytearray)):
                         raw_text = raw.decode("utf-8", errors="ignore")
@@ -246,48 +249,38 @@ async def websocket_handler(ws: WebSocket):
                     if not isinstance(data, dict):
                         continue
 
-                    alts = []
-                    if "channel" in data and isinstance(data["channel"], dict):
-                        alts = data["channel"].get("alternatives", [])
-                    elif "results" in data and isinstance(data["results"], dict):
-                        ch = data["results"].get("channels", [])
-                        if ch and isinstance(ch, list):
-                            alts = ch[0].get("alternatives", [])
-                        else:
-                            alts = data["results"].get("alternatives", [])
+                    evt_type = data.get("type", "")
 
-                    transcript = ""
-                    if alts and isinstance(alts, list):
-                        transcript = alts[0].get("transcript", "").strip()
+                    # *** REALTIME TRANSCRIPTION EVENTS ***
+                    # OpenAI realtime ALWAYS sends STT here:
+                    #   "input_audio_buffer.speech.started"
+                    #   "input_audio_buffer.speech.delta"
+                    #   "input_audio_buffer.speech.completed"
+                    #
+                    if evt_type == "input_audio_buffer.speech.delta":
+                        transcript = data.get("delta", "")
+                        if transcript:
+                            log.info(f"🧠 Realtime partial transcript: {transcript}")
+                            await dg_transcript_queue.put(transcript)
+                        continue
 
-                    if transcript:
-                        log.info(f"🧠 Deepgram partial/final transcript: {transcript}")
-                        await dg_transcript_queue.put(transcript)
+                    # optional final transcript
+                    if evt_type == "input_audio_buffer.speech.completed":
+                        transcript = data.get("text", "")
+                        if transcript:
+                            log.info(f"🧠 Realtime final transcript: {transcript}")
+                            await dg_transcript_queue.put(transcript)
+                        continue
+
+                    # debug unknown events
+                    log.debug(f"Realtime event: {evt_type}")
 
                 except Exception as e:
-                    log.error(f"❌ DG parse error: {e}")
+                    log.error(f"❌ Realtime parse error: {e}")
         except Exception as e:
-            log.error(f"❌ DG listener fatal: {e}")
+            log.error(f"❌ Realtime listener fatal: {e}")
 
-    asyncio.create_task(deepgram_listener_task())
-
-    async def dg_keepalive_task():
-        nonlocal last_audio_time
-        try:
-            while True:
-                await asyncio.sleep(1.2)
-                if time.time() - last_audio_time > 1.5:
-                    try:
-                        silence = (b"\x00\x00") * 4800
-                        await dg_ws.send(silence)
-                        log.info("📨 Sent DG keepalive silence")
-                    except Exception as e:
-                        log.error(f"❌ Error sending keepalive to Deepgram: {e}")
-                        break
-        except asyncio.CancelledError:
-            return
-
-    keepalive_task = asyncio.create_task(dg_keepalive_task())
+    asyncio.create_task(realtime_listener_task())
 
     # -----------------------------------------------------
     # Reader loop: single consumer of ws.receive() to handle both text and bytes
@@ -313,6 +306,11 @@ async def websocket_handler(ws: WebSocket):
                             # immediate interrupt: bump active turn and cancel outstanding TTS tasks
                             turn_id += 1
                             current_active_turn_id = turn_id
+                            try:
+                                while True:
+                                    dg_transcript_queue.get_nowait()
+                            except QueueEmpty:
+                                pass
                             log.info(f"⏹️ Received interrupt from client — new active turn {current_active_turn_id}")
                             # cancel all outstanding tts tasks for older turns
                             for t_id, tasks in list(tts_tasks_by_turn.items()):
@@ -328,7 +326,6 @@ async def websocket_handler(ws: WebSocket):
                             log.debug(f"WS text message (ignored): {data}")
                     elif "bytes" in msg and msg["bytes"] is not None:
                         audio_bytes = msg["bytes"]
-                        # audio_bytes are forwarded to DG sender via queue
                         await incoming_audio_queue.put(audio_bytes)
                         last_audio_time = time.time()
                     else:
@@ -345,9 +342,9 @@ async def websocket_handler(ws: WebSocket):
     reader_task = asyncio.create_task(ws_reader())
 
     # -----------------------------------------------------
-    # DG audio sender: serializes sending bytes to Deepgram
+    # OpenAI audio sender: serializes sending bytes to Realtime
     # -----------------------------------------------------
-    async def dg_audio_sender():
+    async def realtime_audio_sender():
         try:
             while True:
                 data = await incoming_audio_queue.get()
@@ -356,13 +353,16 @@ async def websocket_handler(ws: WebSocket):
                 try:
                     if len(data) % 2 != 0:
                         data = data + b"\x00"
-                    await dg_ws.send(data)
+                    audio_b64 = base64.b64encode(data).decode("utf-8")
+                    await rt_ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio_b64}))
+                    await rt_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                    await rt_ws.send(json.dumps({"type": "response.create", "response": {}}))
                 except Exception as e:
-                    log.error(f"❌ Error sending audio to Deepgram WS: {e}")
+                    log.error(f"❌ Error sending audio to Realtime WS: {e}")
         except asyncio.CancelledError:
             return
 
-    dg_sender_task = asyncio.create_task(dg_audio_sender())
+    rt_sender_task = asyncio.create_task(realtime_audio_sender())
 
     # -----------------------------------------------------
     # Helper: spawn a TTS generation-and-send task (non-blocking)
@@ -431,7 +431,7 @@ async def websocket_handler(ws: WebSocket):
             log.error(f"❌ TTS task error for turn {t_turn}: {e}")
 
     # -----------------------------------------------------
-    # Transcript processor: consumes transcripts found by DG listener
+    # Transcript processor: consumes transcripts found by listener
     # Produces LLM completion (streaming) and spawns TTS tasks concurrently.
     # -----------------------------------------------------
     def _ready_to_speak(buf: str) -> bool:
@@ -461,6 +461,7 @@ async def websocket_handler(ws: WebSocket):
 
                 # record user in history
                 chat_history.append({"role": "user", "content": msg})
+                chat_history[:] = chat_history[-4:]
 
                 # new turn
                 turn_id += 1
@@ -575,6 +576,7 @@ async def websocket_handler(ws: WebSocket):
                     # add assistant to history only if still active
                     if assistant_full_text.strip() and current_turn == current_active_turn_id:
                         chat_history.append({"role": "assistant", "content": assistant_full_text.strip()})
+                        chat_history[:] = chat_history[-4:]
                         log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)})")
 
                     asyncio.create_task(mem0_add(user_id, msg))
@@ -602,15 +604,11 @@ async def websocket_handler(ws: WebSocket):
         except Exception:
             pass
         try:
-            dg_sender_task.cancel()
+            rt_sender_task.cancel()
         except Exception:
             pass
         try:
             transcript_task.cancel()
-        except Exception:
-            pass
-        try:
-            keepalive_task.cancel()
         except Exception:
             pass
         # cancel outstanding TTS tasks
@@ -621,7 +619,7 @@ async def websocket_handler(ws: WebSocket):
                 except Exception:
                     pass
         try:
-            await dg_ws.close()
+            await rt_ws.close()
         except Exception:
             pass
 
@@ -644,4 +642,3 @@ async def send_to_n8n(url: str, text: str) -> str:
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
