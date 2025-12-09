@@ -35,7 +35,7 @@ NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID", "").strip()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 
 # Feature flags / tuning via env
-USE_SSML = os.getenv("USE_SSML", "1") == "1"
+USE_SSML = os.getenv("USE_SSML", "0") == "1"  # default off to avoid speaking SSML tags
 CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "40"))  # lower -> start TTS earlier
 PUNCTUATE_WITH_LLM = os.getenv("PUNCTUATE_WITH_LLM", "0") == "1"
 COGNITIVE_PACING_MS = int(os.getenv("COGNITIVE_PACING_MS", "60"))  # 40–70ms is ideal
@@ -189,7 +189,7 @@ def _is_similar(a: str, b: str):
 
 
 # =====================================================
-# Utility: prepare TTS input with light SSML
+# Utility: prepare TTS input (no SSML wrapper to avoid speaking “speak”)
 # =====================================================
 def escape_for_ssml(s: str) -> str:  # basic escape for XML
     return html.escape(s, quote=False)
@@ -217,12 +217,14 @@ async def reshape_for_speech(text: str) -> str:
 
 
 def make_ssml_from_text(text: str, rate: float = None) -> str:
+    """
+    Previously returned an SSML-wrapped string like <speak>…</speak>, which could
+    be spoken literally as the word "speak". Now it simply returns the plain text.
+    """
     t = text.strip()
     if not t:
         return t
-    t_esc = escape_for_ssml(t)
-    r = rate if rate is not None else BASE_PROSODY_RATE
-    return f'<speak><prosody rate="{r:.2f}">{t_esc}</prosody></speak>'
+    return t
 
 
 # =====================================================
@@ -624,7 +626,7 @@ async def websocket_handler(ws: WebSocket):
                     # add assistant to history only if still active
                     if assistant_full_text.strip() and current_turn == current_active_turn_id:
                         chat_history.append({"role": "assistant", "content": assistant_full_text.strip()})
-                        log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)})")
+                        log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)}")
 
                     asyncio.create_task(mem0_add(user_id, msg))
                 except Exception as e:
