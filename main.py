@@ -169,14 +169,13 @@ def make_ssml_from_text(text: str) -> str:
     return f'<speak><prosody rate="1.30">{t_esc}</prosody></speak>'
 
 # =====================================================
-# WEBSOCKET HANDLER - improved: single receiver + cancellable TTS tasks
+# WEBSOCKET HANDLER
 # =====================================================
 @app.websocket("/ws")
 async def websocket_handler(ws: WebSocket):
     await ws.accept()
 
     user_id = "solomon_roth"
-    recent_msgs = []
     processed_messages = set()
 
     chat_history: List[Dict] = []
@@ -239,23 +238,17 @@ async def websocket_handler(ws: WebSocket):
         log.error(f"❌ Failed to connect to OpenAI Realtime WS: {e}")
         return
 
-    # Queues & task tracking
-    incoming_audio_queue: Queue = Queue()   # bytes from client -> OA sender
+    incoming_audio_queue: Queue = Queue()
     tts_tasks_by_turn: Dict[int, Set[asyncio.Task]] = {}
-
     last_audio_time = time.time()
 
-    # -- OpenAI Realtime listener: forward audio deltas and announce on response.created
+    # --- Realtime listener with broader event handling ---
     async def realtime_listener_task():
         nonlocal turn_id, current_active_turn_id
         try:
             async for raw in rt_ws:
                 try:
-                    if isinstance(raw, (bytes, bytearray)):
-                        raw_text = raw.decode("utf-8", errors="ignore")
-                    else:
-                        raw_text = raw
-
+                    raw_text = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else raw
                     data = json.loads(raw_text)
                     if not isinstance(data, dict):
                         continue
@@ -271,8 +264,8 @@ async def websocket_handler(ws: WebSocket):
                             pass
                         continue
 
-                    if evt_type == "response.output_audio.delta":
-                        audio_b64 = data.get("delta", "")
+                    if evt_type in ("response.output_audio.delta", "response.audio.delta"):
+                        audio_b64 = data.get("delta") or data.get("audio") or ""
                         if audio_b64:
                             try:
                                 audio_bytes = base64.b64decode(audio_b64)
@@ -281,8 +274,11 @@ async def websocket_handler(ws: WebSocket):
                                 log.error(f"❌ Error sending audio delta to client: {e}")
                         continue
 
-                    log.debug(f"Realtime event: {evt_type}")
+                    if evt_type and evt_type.startswith("error"):
+                        log.error(f"❌ Realtime error event: {data}")
+                        continue
 
+                    log.info(f"Realtime event: {evt_type} keys={list(data.keys())}")
                 except Exception as e:
                     log.error(f"❌ Realtime parse error: {e}")
         except Exception as e:
@@ -290,9 +286,7 @@ async def websocket_handler(ws: WebSocket):
 
     asyncio.create_task(realtime_listener_task())
 
-    # -----------------------------------------------------
-    # Reader loop: single consumer of ws.receive() to handle both text and bytes
-    # -----------------------------------------------------
+    # Reader loop
     async def ws_reader():
         nonlocal last_audio_time, turn_id, current_active_turn_id
         try:
@@ -300,9 +294,7 @@ async def websocket_handler(ws: WebSocket):
                 msg = await ws.receive()
                 if msg is None:
                     break
-
                 mtype = msg.get("type")
-
                 if mtype == "websocket.receive":
                     if "text" in msg and msg["text"] is not None:
                         try:
@@ -311,11 +303,9 @@ async def websocket_handler(ws: WebSocket):
                             continue
                         typ = data.get("type")
                         if typ == "interrupt":
-                            # immediate interrupt: bump active turn and cancel outstanding TTS tasks
                             turn_id += 1
                             current_active_turn_id = turn_id
                             log.info(f"⏹️ Received interrupt from client — new active turn {current_active_turn_id}")
-                            # cancel all outstanding tts tasks for older turns
                             for t_id, tasks in list(tts_tasks_by_turn.items()):
                                 if t_id != current_active_turn_id:
                                     for t in tasks:
@@ -325,16 +315,12 @@ async def websocket_handler(ws: WebSocket):
                                             pass
                                     tts_tasks_by_turn.pop(t_id, None)
                         else:
-                            # other text messages can be logged
                             log.debug(f"WS text message (ignored): {data}")
                     elif "bytes" in msg and msg["bytes"] is not None:
                         audio_bytes = msg["bytes"]
                         log.info(f"🎤 Received audio frame from client, len={len(audio_bytes)} bytes")
                         await incoming_audio_queue.put(audio_bytes)
                         last_audio_time = time.time()
-                    else:
-                        # ignore other forms
-                        pass
                 elif mtype == "websocket.disconnect":
                     log.info("WS reader noticed disconnect")
                     break
@@ -345,9 +331,7 @@ async def websocket_handler(ws: WebSocket):
 
     reader_task = asyncio.create_task(ws_reader())
 
-    # -----------------------------------------------------
-    # OpenAI audio sender: serializes sending bytes to Realtime
-    # -----------------------------------------------------
+    # Audio sender
     async def realtime_audio_sender():
         try:
             while True:
@@ -369,70 +353,7 @@ async def websocket_handler(ws: WebSocket):
 
     rt_sender_task = asyncio.create_task(realtime_audio_sender())
 
-    # -----------------------------------------------------
-    # Helper: spawn a TTS generation-and-send task (non-blocking)
-    # (retained but unused in Realtime flow)
-    # -----------------------------------------------------
-    async def _tts_and_send(tts_text: str, t_turn: int):
-        try:
-            if PUNCTUATE_WITH_LLM:
-                try:
-                    punct_resp = await openai_client.chat.completions.create(
-                        model=GPT_MODEL,
-                        messages=[
-                            {"role": "system", "content": "Punctuate and improve this text for natural spoken TTS output."},
-                            {"role": "user", "content": tts_text}
-                        ],
-                        temperature=0,
-                        max_tokens=max(3, int(len(tts_text) * 0.6))
-                    )
-                    punct_text = punct_resp.choices[0].message["content"].strip()
-                    tts_payload = make_ssml_from_text(punct_text) if USE_SSML else punct_text
-                except Exception as e:
-                    log.debug(f"Punctuation LLM failed: {e}")
-                    tts_payload = make_ssml_from_text(tts_text) if USE_SSML else tts_text
-            else:
-                tts_payload = make_ssml_from_text(tts_text) if USE_SSML else tts_text
-
-            if t_turn != current_active_turn_id:
-                log.info(f"🔁 TTS task for turn {t_turn} cancelled before create (active={current_active_turn_id})")
-                return
-
-            tts = await openai_client.audio.speech.create(
-                model="gpt-4o-mini-tts",
-                voice="alloy",
-                input=tts_payload
-            )
-
-            if t_turn != current_active_turn_id:
-                log.info(f"🔁 TTS task for turn {t_turn} cancelled after generation (active={current_active_turn_id})")
-                return
-
-            try:
-                await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": t_turn}))
-            except Exception:
-                pass
-
-            audio_bytes = await tts.aread()
-            if t_turn != current_active_turn_id:
-                log.info(f"🔁 TTS task for turn {t_turn} cancelled after aread (active={current_active_turn_id})")
-                return
-
-            try:
-                await ws.send_bytes(audio_bytes)
-                log.info(f"🎙️ TTS SENT for turn={t_turn}, len={len(audio_bytes)}")
-            except Exception as e:
-                log.error(f"Failed to send TTS bytes for turn {t_turn}: {e}")
-
-        except asyncio.CancelledError:
-            log.info(f"🔁 TTS task for turn {t_turn} cancelled (task cancelled).")
-            return
-        except Exception as e:
-            log.error(f"❌ TTS task error for turn {t_turn}: {e}")
-
-    # -----------------------------------------------------
-    # Cleanup & shutdown handling
-    # -----------------------------------------------------
+    # Cleanup
     try:
         await reader_task
     except Exception:
