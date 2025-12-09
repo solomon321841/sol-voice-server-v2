@@ -242,7 +242,7 @@ async def websocket_handler(ws: WebSocket):
     tts_tasks_by_turn: Dict[int, Set[asyncio.Task]] = {}
     last_audio_time = time.time()
 
-    # --- Realtime listener with broader event handling ---
+    # --- Realtime listener with verbose logging ---
     async def realtime_listener_task():
         nonlocal turn_id, current_active_turn_id
         try:
@@ -254,6 +254,7 @@ async def websocket_handler(ws: WebSocket):
                         continue
 
                     evt_type = data.get("type", "")
+                    log.info(f"Realtime event: {evt_type} payload_keys={list(data.keys())} payload={data}")
 
                     if evt_type == "response.created":
                         turn_id += 1
@@ -278,7 +279,6 @@ async def websocket_handler(ws: WebSocket):
                         log.error(f"❌ Realtime error event: {data}")
                         continue
 
-                    log.info(f"Realtime event: {evt_type} keys={list(data.keys())}")
                 except Exception as e:
                     log.error(f"❌ Realtime parse error: {e}")
         except Exception as e:
