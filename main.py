@@ -251,7 +251,7 @@ async def websocket_handler(ws: WebSocket):
     try:
         log.info("👋 Sending greeting TTS")
         greet_input = make_ssml_from_text(greet, None) if USE_SSML else greet
-        tts_greet = await openai_client.audio.speech.create(model="gpt-4o-mini-tts", voice="marin", input=greet_input)
+        tts_greet = await openai_client.audio.speech.create(model="gpt-4o-mini-tts", voice="cedar", input=greet_input)
         await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": 0}))
         await ws.send_bytes(await tts_greet.aread())
     except Exception as e:
@@ -430,7 +430,7 @@ async def websocket_handler(ws: WebSocket):
                 log.info(f"🔁 TTS task for turn {t_turn} cancelled before create (active={current_active_turn_id})")
                 return
 
-            tts = await openai_client.audio.speech.create(model="gpt-4o-mini-tts", voice="marin", input=tts_payload)
+            tts = await openai_client.audio.speech.create(model="gpt-4o-mini-tts", voice="cedar", input=tts_payload)
 
             if t_turn != current_active_turn_id:
                 log.info(f"🔁 TTS task for turn {t_turn} cancelled after generation (active={current_active_turn_id})")
