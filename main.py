@@ -535,13 +535,21 @@ async def websocket_handler(ws: WebSocket):
                         pending_transcript = maybe_more
                         last_update_ts = time.time()
 
-                # Wait for silence window
-                await asyncio.sleep(FINAL_SILENCE_SEC)
-
-                # If new audio arrived during the wait, keep collecting
-                if time.time() - last_update_ts < FINAL_SILENCE_SEC:
-                    log.info("⏳ More transcript pending; waiting for final input")
-                    continue
+                # Wait until we've had a full silence window with no new transcripts
+                while True:
+                    await asyncio.sleep(FINAL_SILENCE_SEC)
+                    drained = False
+                    while not dg_transcript_queue.empty():
+                        maybe_more = dg_transcript_queue.get_nowait()
+                        if maybe_more:
+                            pending_transcript = maybe_more
+                            last_update_ts = time.time()
+                            drained = True
+                    if drained:
+                        # New text arrived; restart the silence window
+                        continue
+                    if time.time() - last_update_ts >= FINAL_SILENCE_SEC:
+                        break  # full silence window observed
 
                 # Only proceed once we have what looks like a final, whole sentence
                 if not _looks_final(pending_transcript):
