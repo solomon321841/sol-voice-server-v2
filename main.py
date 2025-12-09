@@ -46,6 +46,10 @@ MIN_PROSODY_RATE = float(os.getenv("MIN_PROSODY_RATE", "1.20"))
 MAX_PROSODY_RATE = float(os.getenv("MAX_PROSODY_RATE", "1.55"))
 MOMENTUM_ALPHA = float(os.getenv("MOMENTUM_ALPHA", "0.15"))
 
+# Finalization tuning
+FINAL_SILENCE_SEC = float(os.getenv("FINAL_SILENCE_SEC", "0.65"))
+MIN_FINAL_WORDS = int(os.getenv("MIN_FINAL_WORDS", "4"))
+
 # =====================================================
 # n8n ENDPOINTS
 # =====================================================
@@ -188,9 +192,22 @@ def _is_similar(a: str, b: str):
 
 
 # =====================================================
+# Finalization helpers
+# =====================================================
+def _looks_final(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    if t.endswith((".", "!", "?")):
+        return True
+    words = t.split()
+    return len(words) >= MIN_FINAL_WORDS
+
+
+# =====================================================
 # Utility: prepare TTS input (no SSML wrapper to avoid speaking “speak”)
 # =====================================================
-def escape_for_ssML(s: str) -> str:  # basic escape for XML
+def escape_for_ssml(s: str) -> str:  # basic escape for XML
     return html.escape(s, quote=False)
 
 
@@ -502,6 +519,17 @@ async def websocket_handler(ws: WebSocket):
 
                 if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
                     log.info("⏭ Ignoring very short / non-alpha transcript")
+                    continue
+
+                # Wait briefly to see if more transcript arrives (finalization gate)
+                await asyncio.sleep(FINAL_SILENCE_SEC)
+                if not dg_transcript_queue.empty():
+                    log.info("⏳ More transcript pending; waiting for final input")
+                    continue
+
+                # Only proceed if the transcript looks final or has enough words
+                if not _looks_final(transcript):
+                    log.info("⏭ Transcript does not look final yet; skipping this turn")
                     continue
 
                 msg = transcript
