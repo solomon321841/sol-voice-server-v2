@@ -4,19 +4,18 @@ import logging
 import asyncio
 import time
 import string
-import html
-from asyncio import Queue
-from collections import deque
 from typing import List, Dict, Set
-
-import httpx
-import uvicorn
-import websockets
 from dotenv import load_dotenv
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 from openai import AsyncOpenAI
+import websockets
+from asyncio import Queue
+import html
+from collections import deque
 
 # =====================================================
 # LOGGING
@@ -28,6 +27,7 @@ log = logging.getLogger("main")
 # ENV
 # =====================================================
 load_dotenv()
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 MEMO_API_KEY = os.getenv("MEMO_API_KEY", "").strip()
 NOTION_API_KEY = os.getenv("NOTION_API_KEY", "").strip()
@@ -36,16 +36,19 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 
 # Feature flags / tuning via env
 USE_SSML = os.getenv("USE_SSML", "0") == "1"  # default off to avoid speaking SSML tags
-CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "40"))  # lower -> start TTS earlier
-PUNCTUATE_WITH_LLM = os.getenv("PUNCTUATE_WITH_LLM", "0") == "1"
-COGNITIVE_PACING_MS = int(os.getenv("COGNITIVE_PACING_MS", "60"))  # 40–70ms is ideal
-SPEECH_RESHAPE = os.getenv("SPEECH_RESHAPE", "0") == "1"
-MOMENTUM_ENABLED = os.getenv("MOMENTUM_ENABLED", "1") == "1"
+CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "40"))  # retained but unused
+PUNCTUATE_WITH_LLM = os.getenv("PUNCTUATE_WITH_LLM", "0") == "1"  # retained but unused
+COGNITIVE_PACING_MS = int(os.getenv("COGNITIVE_PACING_MS", "60"))  # retained but unused
+SPEECH_RESHAPE = os.getenv("SPEECH_RESHAPE", "0") == "1"  # retained but unused
+MOMENTUM_ENABLED = os.getenv("MOMENTUM_ENABLED", "1") == "1"  # retained but unused
+BASE_PROSODY_RATE = float(os.getenv("BASE_PROSODY_RATE", "1.30"))  # retained but unused
+MIN_PROSODY_RATE = float(os.getenv("MIN_PROSODY_RATE", "1.20"))  # retained but unused
+MAX_PROSODY_RATE = float(os.getenv("MAX_PROSODY_RATE", "1.55"))  # retained but unused
+MOMENTUM_ALPHA = float(os.getenv("MOMENTUM_ALPHA", "0.15"))  # retained but unused
 
-BASE_PROSODY_RATE = float(os.getenv("BASE_PROSODY_RATE", "1.30"))
-MIN_PROSODY_RATE = float(os.getenv("MIN_PROSODY_RATE", "1.20"))
-MAX_PROSODY_RATE = float(os.getenv("MAX_PROSODY_RATE", "1.55"))
-MOMENTUM_ALPHA = float(os.getenv("MOMENTUM_ALPHA", "0.15"))
+# Finalization tuning (retained but unused)
+FINAL_SILENCE_SEC = float(os.getenv("FINAL_SILENCE_SEC", "0.65"))
+MIN_FINAL_WORDS = int(os.getenv("MIN_FINAL_WORDS", "3"))
 
 # =====================================================
 # n8n ENDPOINTS
@@ -57,24 +60,8 @@ N8N_PLATE_URL = "https://n8n.marshall321.org/webhook/agent/plate"
 # MODEL
 # =====================================================
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-GPT_MODEL = "gpt-5-nano"
-_recent_rates = deque(maxlen=5)
-
-
-def compute_rate_for_segment(text: str) -> float:
-    if not MOMENTUM_ENABLED:
-        return BASE_PROSODY_RATE
-    words = len(text.split())
-    target = BASE_PROSODY_RATE
-    if words <= 6:
-        target += 0.05
-    elif words >= 14:
-        target -= 0.03
-    prev = _recent_rates[-1] if _recent_rates else BASE_PROSODY_RATE
-    rate = prev + MOMENTUM_ALPHA * (target - prev)
-    rate = max(MIN_PROSODY_RATE, min(MAX_PROSODY_RATE, rate))
-    _recent_rates.append(rate)
-    return rate
+GPT_MODEL = "gpt-4o-mini"
+_recent_rates = deque(maxlen=5)  # retained but unused
 
 
 # =====================================================
@@ -101,19 +88,18 @@ async def health():
 
 
 # =====================================================
-# MEM0 HELPERS
+# MEM0 HELPERS (from old main)
 # =====================================================
 async def mem0_search(user_id: str, query: str):
     if not MEMO_API_KEY:
         return []
-    headers = {"Authorization": f"Token MEMO_API_KEY"}
+    headers = {"Authorization": f"Token {MEMO_API_KEY}"}
     payload = {"filters": {"user_id": user_id}, "query": query}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.post("https://api.mem0.ai/v2/memories/", headers=headers, json=payload)
-        if r.status_code == 200:
-            out = r.json()
-            return out if isinstance(out, list) else []
+            if r.status_code == 200:
+                return r.json() if isinstance(r.json(), list) else []
     except Exception as e:
         log.error(f"MEM0 search error: {e}")
     return []
@@ -143,7 +129,7 @@ def memory_context(memories: list) -> str:
 
 
 # =====================================================
-# NOTION PROMPT
+# NOTION PROMPT (from old main)
 # =====================================================
 async def get_notion_prompt():
     if not NOTION_PAGE_ID or not NOTION_API_KEY:
@@ -159,11 +145,12 @@ async def get_notion_prompt():
             r = await c.get(url, headers=headers)
             r.raise_for_status()
             data = r.json()
-        parts = []
-        for blk in data.get("results", []):
-            if blk.get("type") == "paragraph":
-                parts.append("".join([t.get("plain_text", "") for t in blk["paragraph"]["rich_text"]]))
-        return "\n".join(parts).strip() or "You are Solomon Roth’s AI assistant, Silas."
+            parts = []
+            for blk in data.get("results", []):
+                if blk.get("type") == "paragraph":
+                    txt = "".join([r.get("plain_text", "") for r in blk["paragraph"]["rich_text"]])
+                    parts.append(txt)
+            return "\n".join(parts).strip() or "You are Solomon Roth’s AI assistant, Silas."
     except Exception as e:
         log.error(f"❌ Notion error: {e}")
         return "You are Solomon Roth’s AI assistant, Silas."
@@ -189,26 +176,34 @@ def _is_similar(a: str, b: str):
 
 
 # =====================================================
+# Finalization helpers (retained but not used)
+# =====================================================
+def _looks_final(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    if t.endswith((".", "!", "?")):
+        return True
+    words = t.split()
+    return len(words) >= MIN_FINAL_WORDS
+
+
+# =====================================================
 # Utility: prepare TTS input (no SSML wrapper to avoid speaking “speak”)
 # =====================================================
-def escape_for_ssml(s: str) -> str:
-    # basic escape for XML
+def escape_for_ssml(s: str) -> str:  # basic escape for XML
     return html.escape(s, quote=False)
 
 
 async def reshape_for_speech(text: str) -> str:
-    # Tiny, low-cost rewrite for natural spoken English; contractions, smoother cadence.
+    # retained but unused in the low-latency path
     try:
         resp = await openai_client.chat.completions.create(
             model=GPT_MODEL,
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "Rewrite the user's text into natural spoken English for voice TTS. "
-                        "Keep meaning, use contractions, avoid long sentences, avoid hedging, "
-                        "1 short spoken clause. No markup."
-                    ),
+                    "content": "Rewrite the user's text into natural spoken English for voice TTS. Keep meaning, use contractions, avoid long sentences, avoid hedging, 1 short spoken clause. No markup.",
                 },
                 {"role": "user", "content": text},
             ],
@@ -222,10 +217,6 @@ async def reshape_for_speech(text: str) -> str:
 
 
 def make_ssml_from_text(text: str, rate: float = None) -> str:
-    """
-    Previously returned an SSML-wrapped string like <speak>…</speak>, which could be spoken
-    literally as the word "speak". Now it simply returns the plain text.
-    """
     t = text.strip()
     if not t:
         return t
@@ -249,15 +240,18 @@ async def websocket_handler(ws: WebSocket):
 
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I’m Silas."
+    system_msg_static = (
+        prompt
+        + "\n\nSpeaking style: Respond concisely in 1–3 sentences, like live conversation. "
+        "Prioritize fast, direct answers over long explanations. "
+        "Use conversational context from earlier turns to stay coherent, concise, and human-like."
+    )
 
     # Greeting
     try:
         log.info("👋 Sending greeting TTS")
-        greet_rate = compute_rate_for_segment(greet)
-        greet_input = make_ssml_from_text(greet, greet_rate) if USE_SSML else greet
-        tts_greet = await openai_client.audio.speech.create(
-            model="gpt-4o-mini-tts", voice="cedar", input=greet_input
-        )
+        greet_input = make_ssml_from_text(greet, None) if USE_SSML else greet
+        tts_greet = await openai_client.audio.speech.create(model="gpt-4o-mini-tts", voice="marin", input=greet_input)
         await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": 0}))
         await ws.send_bytes(await tts_greet.aread())
     except Exception as e:
@@ -293,27 +287,35 @@ async def websocket_handler(ws: WebSocket):
     tts_tasks_by_turn: Dict[int, Set[asyncio.Task]] = {}
     last_audio_time = time.time()
 
-    # -- Deepgram listener (as before) pushes transcripts into dg_transcript_queue
+    # -- Deepgram listener (accept only final transcripts)
     async def deepgram_listener_task():
         try:
             async for raw in dg_ws:
                 try:
-                    raw_text = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else raw
+                    if isinstance(raw, (bytes, bytearray)):
+                        raw_text = raw.decode("utf-8", errors="ignore")
+                    else:
+                        raw_text = raw
                     data = json.loads(raw_text)
                     if not isinstance(data, dict):
                         continue
+                    is_final = bool(data.get("is_final"))
+                    if not is_final:
+                        continue
+                    alts = []
                     if "channel" in data and isinstance(data["channel"], dict):
                         alts = data["channel"].get("alternatives", [])
                     elif "results" in data and isinstance(data["results"], dict):
                         ch = data["results"].get("channels", [])
-                        alts = ch[0].get("alternatives", []) if ch and isinstance(ch, list) else []
+                        if ch and isinstance(ch, list):
+                            alts = ch[0].get("alternatives", [])
                     else:
-                        alts = data["results"].get("alternatives", []) if "results" in data else []
+                        alts = data["results"].get("alternatives", [])
                     transcript = ""
                     if alts and isinstance(alts, list):
                         transcript = alts[0].get("transcript", "").strip()
                     if transcript:
-                        log.info(f"🧠 Deepgram partial/final transcript: {transcript}")
+                        log.info(f"🧠 Deepgram final transcript: {transcript}")
                         await dg_transcript_queue.put(transcript)
                 except Exception as e:
                     log.error(f"❌ DG parse error: {e}")
@@ -415,57 +417,34 @@ async def websocket_handler(ws: WebSocket):
 
     # -----------------------------------------------------
     # Helper: spawn a TTS generation-and-send task (non-blocking)
-    # Each task checks turn validity before sending. Tasks are cancellable.
+    # Minimal path: no rate, no reshape, no punctuation, immediate send.
     # -----------------------------------------------------
     async def _tts_and_send(tts_text: str, t_turn: int):
         try:
-            if SPEECH_RESHAPE:
-                tts_text = await reshape_for_speech(tts_text)
-            seg_rate = compute_rate_for_segment(tts_text)
-
-            if PUNCTUATE_WITH_LLM:
-                try:
-                    punct_resp = await openai_client.chat.completions.create(
-                        model=GPT_MODEL,
-                        messages=[
-                            {"role": "system", "content": "Punctuate and improve this text for natural spoken TTS output."},
-                            {"role": "user", "content": tts_text},
-                        ],
-                        temperature=0,
-                        max_tokens=max(3, int(len(tts_text) * 0.6)),
-                    )
-                    punct_text = punct_resp.choices[0].message["content"].strip()
-                    tts_payload = make_ssml_from_text(punct_text, seg_rate) if USE_SSML else punct_text
-                except Exception as e:
-                    log.debug(f"Punctuation LLM failed: {e}")
-                    tts_payload = make_ssml_from_text(tts_text, seg_rate) if USE_SSML else tts_text
+            if USE_SSML:
+                tts_payload = make_ssml_from_text(tts_text, None)
             else:
-                tts_payload = make_ssml_from_text(tts_text, seg_rate) if USE_SSML else tts_text
+                tts_payload = tts_text
 
-            # early bail-out if turn changed
             if t_turn != current_active_turn_id:
                 log.info(f"🔁 TTS task for turn {t_turn} cancelled before create (active={current_active_turn_id})")
                 return
 
-            tts = await openai_client.audio.speech.create(model="gpt-4o-mini-tts", voice="cedar", input=tts_payload)
+            tts = await openai_client.audio.speech.create(model="gpt-4o-mini-tts", voice="marin", input=tts_payload)
 
-            # double-check again before sending audio bytes
             if t_turn != current_active_turn_id:
                 log.info(f"🔁 TTS task for turn {t_turn} cancelled after generation (active={current_active_turn_id})")
                 return
 
-            # notify client metadata for upcoming binary frame(s)
             try:
                 await ws.send_text(json.dumps({"type": "tts_chunk", "turn_id": t_turn}))
             except Exception:
                 pass
 
-            # stream the audio bytes (aread returns bytes)
             audio_bytes = await tts.aread()
             if t_turn != current_active_turn_id:
                 log.info(f"🔁 TTS task for turn {t_turn} cancelled after aread (active={current_active_turn_id})")
                 return
-
             try:
                 await ws.send_bytes(audio_bytes)
                 log.info(f"🎙️ TTS SENT for turn={t_turn}, len={len(audio_bytes)}")
@@ -478,26 +457,29 @@ async def websocket_handler(ws: WebSocket):
             log.error(f"❌ TTS task error for turn {t_turn}: {e}")
 
     # -----------------------------------------------------
-    # Transcript processor: consumes transcripts found by DG listener
-    # Produces LLM completion (streaming) and spawns TTS tasks concurrently.
+    # Transcript processor: immediate processing; no buffering/waits.
     # -----------------------------------------------------
-    def _ready_to_speak(buf: str) -> bool:
-        # Speak when the model finishes a thought OR the buffer gets long
-        return any(p in buf for p in [".", "?", "!"]) or len(buf) >= CHUNK_CHAR_THRESHOLD
-
     async def transcript_processor():
         nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id, current_active_turn_id, chat_history
+        pending_transcript = ""
+        last_update_ts = 0.0
+
         try:
             while True:
                 transcript = await dg_transcript_queue.get()
                 if transcript is None:
                     break
 
-                if not transcript or len(transcript) < 3 or not any(ch.isalpha() for ch in transcript):
+                if not transcript or len(transcript) < 1 or not any(ch.isalpha() for ch in transcript):
                     log.info("⏭ Ignoring very short / non-alpha transcript")
                     continue
 
-                msg = transcript
+                pending_transcript = transcript
+                last_update_ts = time.time()
+
+                msg = pending_transcript
+                pending_transcript = ""
+
                 norm = _normalize(msg)
                 now = time.time()
                 recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
@@ -516,27 +498,18 @@ async def websocket_handler(ws: WebSocket):
                 log.info(f"🎯 NEW TURN {current_turn}: '{msg}' (history len={len(chat_history)})")
 
                 mems = await mem0_search(user_id, msg)
-                ctx = memory_context(mems)
-                sys_prompt = f"{prompt}\n\nFacts:\n{ctx}"
-                system_msg = (
-                    sys_prompt
-                    + "\n\nSpeaking style: Respond concisely in 1–3 sentences, like live conversation. "
-                    + "Prioritize fast, direct answers over long explanations."
-                    + "\nFrom now on, output in clean spoken segments.\n"
-                    + "Each complete thought MUST end with the token <SEG>.\n"
-                    + "Each segment should be 6–14 words.\n"
-                    + "Never place <SEG> mid-thought.\n"
-                    + "Never output extremely short segments (under 4 words).\n"
-                    + "Your voice output depends on these segments being natural."
-                    + "\nUse conversational context from earlier turns to stay coherent, concise, and human-like."
-                    + "\nCognitive pacing rules:\n"
-                    + "Before producing a segment, think through the idea internally.\n"
-                    + "Then express the thought clearly in natural spoken language.\n"
-                    + "Never rush. Never output half-formed ideas.\n"
-                    + "Each <SEG> should represent one clean, complete thought."
-                )
+                mem_facts = ""
+                if mems:
+                    parts = []
+                    for m in mems[:3]:
+                        txt = m.get("memory") or m.get("content") or m.get("text")
+                        if txt:
+                            parts.append(txt.strip())
+                    if parts:
+                        mem_facts = "Memory: " + " ".join(parts)
 
                 lower = msg.lower()
+
                 # Plate logic
                 if any(k in lower for k in plate_kw):
                     if msg in processed_messages:
@@ -549,7 +522,6 @@ async def websocket_handler(ws: WebSocket):
                         continue
                     t_task = asyncio.create_task(_tts_and_send(reply, current_turn))
                     tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
-                    # cleanup finished tasks in background
                     t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
                     continue
 
@@ -564,9 +536,14 @@ async def websocket_handler(ws: WebSocket):
                     t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
                     continue
 
-                # General GPT streaming -> spawn non-blocking TTS for chunks
+                # General GPT streaming -> spawn non-blocking TTS for each token immediately
                 try:
-                    messages = [{"role": "system", "content": system_msg}] + chat_history
+                    history_tail = chat_history[-3:]
+                    messages = [{"role": "system", "content": system_msg_static}]
+                    if mem_facts:
+                        messages.append({"role": "system", "content": mem_facts})
+                    messages += history_tail
+
                     log.info(f"🤖 GPT START turn={current_turn}, active={current_active_turn_id}, messages_len={len(messages)}")
                     stream = await openai_client.chat.completions.create(
                         model=GPT_MODEL,
@@ -574,18 +551,7 @@ async def websocket_handler(ws: WebSocket):
                         stream=True,
                     )
 
-                    buffer = ""
                     assistant_full_text = ""
-
-                    def _extract_segments(buf: str):
-                        segments = []
-                        while "<SEG>" in buf:
-                            idx = buf.index("<SEG>")
-                            seg = buf[:idx].strip()
-                            if seg:
-                                segments.append(seg)
-                            buf = buf[idx + 5 :]
-                        return segments, buf
 
                     async for chunk in stream:
                         if current_turn != current_active_turn_id:
@@ -595,31 +561,17 @@ async def websocket_handler(ws: WebSocket):
                         if not delta:
                             continue
                         assistant_full_text += delta
-                        buffer += delta
-                        segments, buffer = _extract_segments(buffer)
-                        for seg in segments:
-                            if current_turn != current_active_turn_id:
-                                log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
-                                break
-                            chunk_text = seg
-                            await asyncio.sleep(COGNITIVE_PACING_MS / 1000.0)
-                            t_task = asyncio.create_task(_tts_and_send(chunk_text, current_turn))
-                            tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
-                            # ensure we remove finished tasks later
-                            t_task.add_done_callback(
-                                lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut)
-                            )
-
-                    # final buffer
-                    if buffer.strip() and current_turn == current_active_turn_id:
-                        t_task = asyncio.create_task(_tts_and_send(buffer, current_turn))
+                        if current_turn != current_active_turn_id:
+                            log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
+                            break
+                        t_task = asyncio.create_task(_tts_and_send(delta, current_turn))
                         tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
                         t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
 
-                    # add assistant to history only if still active
                     if assistant_full_text.strip() and current_turn == current_active_turn_id:
                         chat_history.append({"role": "assistant", "content": assistant_full_text.strip()})
-                        log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)}")
+                        log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)})")
+
                     asyncio.create_task(mem0_add(user_id, msg))
                 except Exception as e:
                     log.error(f"LLM error: {e}")
@@ -668,17 +620,35 @@ async def websocket_handler(ws: WebSocket):
 
 
 # =====================================================
-# helper for n8n calls (same as before)
+# helper for n8n calls (aligned with old main behavior)
 # =====================================================
 async def send_to_n8n(url: str, text: str) -> str:
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.post(url, json={"text": text})
-        if r.status_code == 200:
-            return r.text
+        async with httpx.AsyncClient(timeout=20) as c:
+            payload = {"message": text}
+            r = await c.post(url, json=payload)
+            log.info(f"📩 n8n raw response: {r.text}")
+
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                    if isinstance(data, dict):
+                        return (
+                            data.get("reply")
+                            or data.get("message")
+                            or data.get("text")
+                            or data.get("output")
+                            or json.dumps(data, indent=2)
+                        ).strip()
+                    if isinstance(data, list):
+                        return " ".join(str(x) for x in data)
+                    return str(data)
+                except Exception:
+                    return r.text.strip()
+            return "Sorry, the automation returned an unexpected response."
     except Exception as e:
         log.error(f"n8n error: {e}")
-    return "Okay."
+        return "Sorry, couldn't reach automation."
 
 
 # =====================================================
