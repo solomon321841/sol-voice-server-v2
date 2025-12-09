@@ -75,7 +75,7 @@ async def health():
 async def mem0_search(user_id: str, query: str):
     if not MEMO_API_KEY:
         return []
-    headers = {"Authorization": f"Token MEMO_API_KEY"}
+    headers = {"Authorization": f"Token {MEMO_API_KEY}"}
     payload = {"filters": {"user_id": user_id}, "query": query}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
@@ -313,6 +313,7 @@ async def websocket_handler(ws: WebSocket):
                             # immediate interrupt: bump active turn and cancel outstanding TTS tasks
                             turn_id += 1
                             current_active_turn_id = turn_id
+                            buffer = ""
                             log.info(f"⏹️ Received interrupt from client — new active turn {current_active_turn_id}")
                             # cancel all outstanding tts tasks for older turns
                             for t_id, tasks in list(tts_tasks_by_turn.items()):
