@@ -60,7 +60,7 @@ N8N_PLATE_URL = "https://n8n.marshall321.org/webhook/agent/plate"
 # MODEL
 # =====================================================
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-GPT_MODEL = "gpt-5-mini"
+GPT_MODEL = "gpt-4.1-mini"
 _recent_rates = deque(maxlen=5)
 
 # =====================================================
