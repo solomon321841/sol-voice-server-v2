@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
-from fastapi.middleware. cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from openai import AsyncOpenAI
 import websockets
@@ -29,26 +29,26 @@ log = logging.getLogger("main")
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-MEMO_API_KEY = os. getenv("MEMO_API_KEY", "").strip()
+MEMO_API_KEY = os.getenv("MEMO_API_KEY", "").strip()
 NOTION_API_KEY = os.getenv("NOTION_API_KEY", "").strip()
 NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID", "").strip()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 
 # Feature flags / tuning via env
 USE_SSML = os.getenv("USE_SSML", "0") == "1"
-CHUNK_CHAR_THRESHOLD = int(os. getenv("CHUNK_CHAR_THRESHOLD", "40"))
-PUNCTUATE_WITH_LLM = os. getenv("PUNCTUATE_WITH_LLM", "0") == "1"
-COGNITIVE_PACING_MS = int(os. getenv("COGNITIVE_PACING_MS", "60"))
+CHUNK_CHAR_THRESHOLD = int(os.getenv("CHUNK_CHAR_THRESHOLD", "40"))
+PUNCTUATE_WITH_LLM = os.getenv("PUNCTUATE_WITH_LLM", "0") == "1"
+COGNITIVE_PACING_MS = int(os.getenv("COGNITIVE_PACING_MS", "60"))
 SPEECH_RESHAPE = os.getenv("SPEECH_RESHAPE", "0") == "1"
 MOMENTUM_ENABLED = os.getenv("MOMENTUM_ENABLED", "1") == "1"
 BASE_PROSODY_RATE = float(os.getenv("BASE_PROSODY_RATE", "1.30"))
 MIN_PROSODY_RATE = float(os.getenv("MIN_PROSODY_RATE", "1.20"))
-MAX_PROSODY_RATE = float(os. getenv("MAX_PROSODY_RATE", "1.55"))
-MOMENTUM_ALPHA = float(os. getenv("MOMENTUM_ALPHA", "0.15"))
+MAX_PROSODY_RATE = float(os.getenv("MAX_PROSODY_RATE", "1.55"))
+MOMENTUM_ALPHA = float(os.getenv("MOMENTUM_ALPHA", "0.15"))
 
 # Finalization tuning (retained but unused)
 FINAL_SILENCE_SEC = float(os.getenv("FINAL_SILENCE_SEC", "0.65"))
-MIN_FINAL_WORDS = int(os. getenv("MIN_FINAL_WORDS", "3"))
+MIN_FINAL_WORDS = int(os.getenv("MIN_FINAL_WORDS", "3"))
 
 # =====================================================
 # n8n ENDPOINTS
@@ -62,7 +62,6 @@ N8N_PLATE_URL = "https://n8n.marshall321.org/webhook/agent/plate"
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 GPT_MODEL = "gpt-5-mini"
 _recent_rates = deque(maxlen=5)
-
 
 # =====================================================
 # FASTAPI
@@ -79,10 +78,10 @@ app.add_middleware(
 
 @app.get("/")
 async def home():
-    return {"status": "running", "message": "Silas backend is online. "}
+    return {"status": "running", "message": "Silas backend is online."}
 
 
-@app. get("/health")
+@app.get("/health")
 async def health():
     return {"ok": True}
 
@@ -99,7 +98,7 @@ async def mem0_search(user_id: str, query: str):
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.post("https://api.mem0.ai/v2/memories/", headers=headers, json=payload)
             if r.status_code == 200:
-                return r.json() if isinstance(r. json(), list) else []
+                return r.json() if isinstance(r.json(), list) else []
     except Exception as e:
         log.error(f"MEM0 search error: {e}")
     return []
@@ -136,9 +135,9 @@ async def get_notion_prompt():
         return "You are Solomon Roth's personal AI assistant, Silas."
     url = f"https://api.notion.com/v1/blocks/{NOTION_PAGE_ID}/children"
     headers = {
-        "Authorization":  f"Bearer {NOTION_API_KEY}",
+        "Authorization": f"Bearer {NOTION_API_KEY}",
         "Notion-Version": "2022-06-28",
-        "Content-Type":  "application/json",
+        "Content-Type": "application/json",
     }
     try:
         async with httpx.AsyncClient(timeout=10) as c:
@@ -168,7 +167,7 @@ async def get_prompt_text():
 def _normalize(m: str):
     m = m.lower().strip()
     m = "".join(ch for ch in m if ch not in string.punctuation)
-    return " ".join(m. split())
+    return " ".join(m.split())
 
 
 def _is_similar(a: str, b: str):
@@ -189,7 +188,7 @@ def _looks_final(text: str) -> bool:
 
 
 # =====================================================
-# Utility:  prepare TTS input (no SSML wrapper to avoid speaking "speak")
+# Utility: prepare TTS input (no SSML wrapper to avoid speaking "speak")
 # =====================================================
 def escape_for_ssml(s: str) -> str:
     return html.escape(s, quote=False)
@@ -202,20 +201,20 @@ async def reshape_for_speech(text: str) -> str:
             messages=[
                 {
                     "role": "system",
-                    "content":  "Rewrite the user's text into natural spoken English for voice TTS. Keep meaning, use contractions, avoid long sentences, avoid hedging, 1 short spoken clause.  No markup.",
+                    "content": "Rewrite the user's text into natural spoken English for voice TTS. Keep meaning, use contractions, avoid long sentences, avoid hedging, 1 short spoken clause. No markup.",
                 },
                 {"role": "user", "content": text},
             ],
             temperature=0.2,
             max_tokens=min(60, max(20, len(text) // 2)),
         )
-        out = resp.choices[0].message["content"]. strip()
+        out = resp.choices[0].message["content"].strip()
         return out or text
     except Exception:
         return text
 
 
-def make_ssml_from_text(text:  str, rate: float = None) -> str:
+def make_ssml_from_text(text: str, rate: float = None) -> str:
     t = text.strip()
     if not t:
         return t
@@ -223,7 +222,7 @@ def make_ssml_from_text(text:  str, rate: float = None) -> str:
 
 
 # =====================================================
-# WEBSOCKET HANDLER - improved:  single receiver + cancellable TTS tasks
+# WEBSOCKET HANDLER - improved: single receiver + cancellable TTS tasks
 # with Deepgram reconnect loop and exponential backoff
 # =====================================================
 @app.websocket("/ws")
@@ -232,7 +231,7 @@ async def websocket_handler(ws: WebSocket):
     user_id = "solomon_roth"
     recent_msgs = []
     processed_messages = set()
-    chat_history:  List[Dict] = []
+    chat_history: List[Dict] = []
     turn_id = 0
     current_active_turn_id = 0
     calendar_kw = ["calendar", "meeting", "schedule", "appointment"]
@@ -262,7 +261,7 @@ async def websocket_handler(ws: WebSocket):
         return
 
     # Queues & task tracking
-    incoming_audio_queue:  Queue = Queue()
+    incoming_audio_queue: Queue = Queue()
     dg_transcript_queue: Queue = Queue()
     tts_tasks_by_turn: Dict[int, Set[asyncio.Task]] = {}
     last_audio_time = time.time()
@@ -271,7 +270,7 @@ async def websocket_handler(ws: WebSocket):
     client_connected = True
 
     # -----------------------------------------------------
-    # Reader loop:  single consumer of ws.receive() to handle both text and bytes
+    # Reader loop: single consumer of ws.receive() to handle both text and bytes
     # -----------------------------------------------------
     async def ws_reader():
         nonlocal last_audio_time, turn_id, current_active_turn_id, client_connected
@@ -292,7 +291,7 @@ async def websocket_handler(ws: WebSocket):
                             turn_id += 1
                             current_active_turn_id = turn_id
                             log.info(f"⏹️ Received interrupt from client — new active turn {current_active_turn_id}")
-                            for t_id, tasks in list(tts_tasks_by_turn. items()):
+                            for t_id, tasks in list(tts_tasks_by_turn.items()):
                                 if t_id != current_active_turn_id:
                                     for t in tasks:
                                         try:
@@ -308,7 +307,7 @@ async def websocket_handler(ws: WebSocket):
                         last_audio_time = time.time()
                     else:
                         pass
-                elif mtype == "websocket. disconnect":
+                elif mtype == "websocket.disconnect":
                     log.info("WS reader noticed disconnect")
                     client_connected = False
                     break
@@ -316,15 +315,15 @@ async def websocket_handler(ws: WebSocket):
             log.info("WS reader disconnected")
             client_connected = False
         except Exception as e:
-            log. error(f"ws_reader fatal:  {e}")
+            log.error(f"ws_reader fatal: {e}")
             client_connected = False
 
     reader_task = asyncio.create_task(ws_reader())
 
     # -----------------------------------------------------
-    # Helper:  spawn a TTS generation-and-send task (non-blocking)
+    # Helper: spawn a TTS generation-and-send task (non-blocking)
     # -----------------------------------------------------
-    async def _tts_and_send(tts_text: str, t_turn:  int):
+    async def _tts_and_send(tts_text: str, t_turn: int):
         try:
             if USE_SSML:
                 tts_payload = make_ssml_from_text(tts_text, None)
@@ -335,7 +334,7 @@ async def websocket_handler(ws: WebSocket):
                 log.info(f"🔁 TTS task for turn {t_turn} cancelled before create (active={current_active_turn_id})")
                 return
 
-            tts = await openai_client.audio.speech. create(model="gpt-4o-mini-tts", voice="cedar", input=tts_payload)
+            tts = await openai_client.audio.speech.create(model="gpt-4o-mini-tts", voice="cedar", input=tts_payload)
 
             if t_turn != current_active_turn_id:
                 log.info(f"🔁 TTS task for turn {t_turn} cancelled after generation (active={current_active_turn_id})")
@@ -348,7 +347,7 @@ async def websocket_handler(ws: WebSocket):
 
             audio_bytes = await tts.aread()
             if t_turn != current_active_turn_id:
-                log. info(f"🔁 TTS task for turn {t_turn} cancelled after aread (active={current_active_turn_id})")
+                log.info(f"🔁 TTS task for turn {t_turn} cancelled after aread (active={current_active_turn_id})")
                 return
             try:
                 await ws.send_bytes(audio_bytes)
@@ -375,7 +374,7 @@ async def websocket_handler(ws: WebSocket):
                 if transcript is None:
                     break
 
-                if not transcript or len(transcript) < 1 or not any(ch. isalpha() for ch in transcript):
+                if not transcript or len(transcript) < 1 or not any(ch.isalpha() for ch in transcript):
                     log.info("⏭ Ignoring very short / non-alpha transcript")
                     continue
 
@@ -391,7 +390,7 @@ async def websocket_handler(ws: WebSocket):
                 if any(_is_similar(m, norm) for (m, t) in recent_msgs):
                     log.info(f"⏭ Skipping near-duplicate transcript: '{msg}'")
                     continue
-                recent_msgs. append((norm, now))
+                recent_msgs.append((norm, now))
 
                 chat_history.append({"role": "user", "content": msg})
 
@@ -404,12 +403,12 @@ async def websocket_handler(ws: WebSocket):
                 mem_facts = ""
                 if mems:
                     parts = []
-                    for m in mems[: 3]:
+                    for m in mems[:3]:
                         txt = m.get("memory") or m.get("content") or m.get("text")
                         if txt:
-                            parts.append(txt. strip())
+                            parts.append(txt.strip())
                     if parts:
-                        mem_facts = "Memory: " + " ". join(parts)
+                        mem_facts = "Memory: " + " ".join(parts)
 
                 lower = msg.lower()
 
@@ -424,7 +423,7 @@ async def websocket_handler(ws: WebSocket):
                         log.info(f"🔁 Plate turn {current_turn} abandoned (active={current_active_turn_id})")
                         continue
                     t_task = asyncio.create_task(_tts_and_send(reply, current_turn))
-                    tts_tasks_by_turn. setdefault(current_turn, set()).add(t_task)
+                    tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
                     t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
                     continue
 
@@ -436,7 +435,7 @@ async def websocket_handler(ws: WebSocket):
                         continue
                     t_task = asyncio.create_task(_tts_and_send(reply, current_turn))
                     tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
-                    t_task. add_done_callback(lambda fut, t=current_turn:  tts_tasks_by_turn.get(t, set()).discard(fut))
+                    t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
                     continue
 
                 # General GPT streaming
@@ -461,7 +460,7 @@ async def websocket_handler(ws: WebSocket):
                         if current_turn != current_active_turn_id:
                             log.info(f"🔁 CANCEL STREAM turn={current_turn}, active={current_active_turn_id}")
                             break
-                        delta = getattr(chunk. choices[0]. delta, "content", "")
+                        delta = getattr(chunk.choices[0].delta, "content", "")
                         if not delta:
                             continue
                         assistant_full_text += delta
@@ -469,29 +468,29 @@ async def websocket_handler(ws: WebSocket):
                         if current_turn != current_active_turn_id:
                             log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
                             break
-                        if len(buffer) >= 22 or buffer.endswith('. ') or buffer.endswith('?') or buffer.endswith('! ') or buffer.endswith(','):
+                        if len(buffer) >= 22 or buffer.endswith(". ") or buffer.endswith("?") or buffer.endswith("! ") or buffer.endswith(","):
                             chunk_text = buffer
                             buffer = ""
                             t_task = asyncio.create_task(_tts_and_send(chunk_text, current_turn))
                             tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
-                            t_task. add_done_callback(lambda fut, t=current_turn:  tts_tasks_by_turn.get(t, set()).discard(fut))
+                            t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
 
                     if buffer.strip() and current_turn == current_active_turn_id:
                         t_task = asyncio.create_task(_tts_and_send(buffer, current_turn))
-                        tts_tasks_by_turn. setdefault(current_turn, set()).add(t_task)
+                        tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
                         t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
 
-                    if assistant_full_text. strip() and current_turn == current_active_turn_id:
-                        chat_history.append({"role": "assistant", "content": assistant_full_text. strip()})
+                    if assistant_full_text.strip() and current_turn == current_active_turn_id:
+                        chat_history.append({"role": "assistant", "content": assistant_full_text.strip()})
                         log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)})")
 
                     asyncio.create_task(mem0_add(user_id, msg))
                 except Exception as e:
-                    log.error(f"LLM error:  {e}")
+                    log.error(f"LLM error: {e}")
         except asyncio.CancelledError:
             log.info("transcript_processor cancelled")
         except Exception as e:
-            log. error(f"❌ transcript_processor fatal: {e}")
+            log.error(f"❌ transcript_processor fatal: {e}")
 
     transcript_task = asyncio.create_task(transcript_processor())
 
@@ -499,8 +498,8 @@ async def websocket_handler(ws: WebSocket):
     # Deepgram reconnect loop with exponential backoff
     # -----------------------------------------------------
     dg_url = (
-        "wss://api.deepgram. com/v1/listen"
-        "? model=nova-2"
+        "wss://api.deepgram.com/v1/listen"
+        "?model=nova-2"
         "&encoding=linear16"
         "&sample_rate=48000"
     )
@@ -510,7 +509,7 @@ async def websocket_handler(ws: WebSocket):
     MAX_BACKOFF = 10.0
     current_backoff = INITIAL_BACKOFF
 
-    async def clear_queue(q:  Queue):
+    async def clear_queue(q: Queue):
         """Drain all items from a queue without blocking."""
         while not q.empty():
             try:
@@ -545,7 +544,7 @@ async def websocket_handler(ws: WebSocket):
                     log.error(f"❌ Failed to connect to Deepgram WS: {e}")
                     if not client_connected:
                         break
-                    log.info(f"⏳ Retrying Deepgram connection in {current_backoff:. 1f}s...")
+                    log.info(f"⏳ Retrying Deepgram connection in {current_backoff:.1f}s...")
                     await asyncio.sleep(current_backoff)
                     current_backoff = min(current_backoff * 2, MAX_BACKOFF)
                     continue
@@ -585,7 +584,7 @@ async def websocket_handler(ws: WebSocket):
                                     log.info(f"🧠 Deepgram final transcript: {transcript}")
                                     await dg_transcript_queue.put(transcript)
                             except Exception as e:
-                                log. error(f"❌ DG parse error: {e}")
+                                log.error(f"❌ DG parse error: {e}")
                     except websockets.exceptions.ConnectionClosed as e:
                         log.warning(f"⚠️ Deepgram connection closed: {e}")
                         raise
@@ -593,11 +592,11 @@ async def websocket_handler(ws: WebSocket):
                         log.error(f"❌ DG listener fatal: {e}")
                         raise
 
-                # -- DG audio sender:  serializes sending bytes to Deepgram
+                # -- DG audio sender: serializes sending bytes to Deepgram
                 async def dg_audio_sender_fn():
                     try:
                         while True:
-                            data = await incoming_audio_queue. get()
+                            data = await incoming_audio_queue.get()
                             if data is None:
                                 break
                             try:
@@ -605,7 +604,7 @@ async def websocket_handler(ws: WebSocket):
                                     data = data + b"\x00"
                                 await dg_ws.send(data)
                             except websockets.exceptions.ConnectionClosed as e:
-                                log.warning(f"⚠️ DG sender:  connection closed: {e}")
+                                log.warning(f"⚠️ DG sender: connection closed: {e}")
                                 raise
                             except Exception as e:
                                 log.error(f"❌ Error sending audio to Deepgram WS: {e}")
@@ -613,7 +612,7 @@ async def websocket_handler(ws: WebSocket):
                     except asyncio.CancelledError:
                         return
                     except Exception as e:
-                        log.error(f"❌ DG sender fatal:  {e}")
+                        log.error(f"❌ DG sender fatal: {e}")
                         raise
 
                 # -- DG keepalive task
@@ -621,27 +620,27 @@ async def websocket_handler(ws: WebSocket):
                     nonlocal last_audio_time
                     try:
                         while True:
-                            await asyncio.sleep(1. 2)
+                            await asyncio.sleep(1.2)
                             if time.time() - last_audio_time > 1.5:
                                 try:
                                     silence = (b"\x00\x00") * 4800
-                                    await dg_ws. send(silence)
+                                    await dg_ws.send(silence)
                                     log.debug("📨 Sent DG keepalive silence")
                                 except websockets.exceptions.ConnectionClosed as e:
                                     log.warning(f"⚠️ DG keepalive: connection closed: {e}")
                                     raise
                                 except Exception as e:
-                                    log.error(f"❌ Error sending keepalive to Deepgram:  {e}")
+                                    log.error(f"❌ Error sending keepalive to Deepgram: {e}")
                                     raise
                     except asyncio.CancelledError:
                         return
                     except Exception as e:
-                        log.error(f"❌ DG keepalive fatal:  {e}")
+                        log.error(f"❌ DG keepalive fatal: {e}")
                         raise
 
                 # Start all three DG tasks
                 dg_listener_task = asyncio.create_task(deepgram_listener_task_fn())
-                dg_sender_task = asyncio. create_task(dg_audio_sender_fn())
+                dg_sender_task = asyncio.create_task(dg_audio_sender_fn())
                 dg_keepalive_task = asyncio.create_task(dg_keepalive_task_fn())
 
                 dg_tasks = {dg_listener_task, dg_sender_task, dg_keepalive_task}
@@ -650,7 +649,7 @@ async def websocket_handler(ws: WebSocket):
                 # Also monitor reader_task to detect client disconnect
                 done, pending = await asyncio.wait(
                     dg_tasks | {reader_task},
-                    return_when=asyncio. FIRST_COMPLETED
+                    return_when=asyncio.FIRST_COMPLETED
                 )
 
                 # Check if reader_task completed (client disconnected)
@@ -660,7 +659,7 @@ async def websocket_handler(ws: WebSocket):
                     # Cancel remaining DG tasks
                     for task in pending:
                         if task != reader_task:
-                            task. cancel()
+                            task.cancel()
                             try:
                                 await task
                             except (asyncio.CancelledError, Exception):
@@ -699,7 +698,7 @@ async def websocket_handler(ws: WebSocket):
                 # Close DG websocket
                 if dg_ws:
                     try:
-                        await dg_ws. close()
+                        await dg_ws.close()
                         log.info("🔒 Closed Deepgram WebSocket")
                     except Exception:
                         pass
@@ -711,7 +710,7 @@ async def websocket_handler(ws: WebSocket):
                 current_backoff = min(current_backoff * 2, MAX_BACKOFF)
 
     # Start the Deepgram connection loop
-    dg_loop_task = asyncio. create_task(deepgram_connection_loop())
+    dg_loop_task = asyncio.create_task(deepgram_connection_loop())
 
     # -----------------------------------------------------
     # Cleanup & shutdown handling
@@ -745,7 +744,7 @@ async def websocket_handler(ws: WebSocket):
             pass
 
         # Cancel outstanding TTS tasks
-        for tasks in tts_tasks_by_turn. values():
+        for tasks in tts_tasks_by_turn.values():
             for t in tasks:
                 try:
                     t.cancel()
@@ -765,7 +764,7 @@ async def websocket_handler(ws: WebSocket):
 # =====================================================
 # helper for n8n calls (aligned with old main behavior)
 # =====================================================
-async def send_to_n8n(url: str, text:  str) -> str:
+async def send_to_n8n(url: str, text: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=20) as c:
             payload = {"message": text}
@@ -777,7 +776,7 @@ async def send_to_n8n(url: str, text:  str) -> str:
                     data = r.json()
                     if isinstance(data, dict):
                         return (
-                            data. get("reply")
+                            data.get("reply")
                             or data.get("message")
                             or data.get("text")
                             or data.get("output")
@@ -787,7 +786,7 @@ async def send_to_n8n(url: str, text:  str) -> str:
                         return " ".join(str(x) for x in data)
                     return str(data)
                 except Exception:
-                    return r.text. strip()
+                    return r.text.strip()
             return "Sorry, the automation returned an unexpected response."
     except Exception as e:
         log.error(f"n8n error: {e}")
@@ -798,5 +797,5 @@ async def send_to_n8n(url: str, text:  str) -> str:
 # SERVER START
 # =====================================================
 if __name__ == "__main__":
-    port = int(os. environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
