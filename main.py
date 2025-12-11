@@ -37,7 +37,7 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 # Feature flags / tuning via env
 USE_SSML = os.getenv("USE_SSML", "0") == "1"
 CHUNK_CHAR_THRESHOLD = int(os. getenv("CHUNK_CHAR_THRESHOLD", "40"))
-PUNCTUATE_WITH_LLM = os.getenv("PUNCTUATE_WITH_LLM", "0") == "1"
+PUNCTUATE_WITH_LLM = os. getenv("PUNCTUATE_WITH_LLM", "0") == "1"
 COGNITIVE_PACING_MS = int(os. getenv("COGNITIVE_PACING_MS", "60"))
 SPEECH_RESHAPE = os.getenv("SPEECH_RESHAPE", "0") == "1"
 MOMENTUM_ENABLED = os.getenv("MOMENTUM_ENABLED", "1") == "1"
@@ -99,7 +99,7 @@ async def mem0_search(user_id: str, query: str):
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.post("https://api.mem0.ai/v2/memories/", headers=headers, json=payload)
             if r.status_code == 200:
-                return r.json() if isinstance(r.json(), list) else []
+                return r.json() if isinstance(r. json(), list) else []
     except Exception as e:
         log.error(f"MEM0 search error: {e}")
     return []
@@ -122,7 +122,7 @@ def memory_context(memories: list) -> str:
         return ""
     lines = []
     for m in memories:
-        txt = m. get("memory") or m.get("content") or m.get("text")
+        txt = m.get("memory") or m.get("content") or m.get("text")
         if txt:
             lines.append(f"- {txt}")
     return "Relevant memories:\n" + "\n".join(lines)
@@ -171,7 +171,7 @@ def _normalize(m: str):
     return " ".join(m. split())
 
 
-def _is_similar(a: str, b:  str):
+def _is_similar(a: str, b: str):
     return bool(a and b and (a == b or a.startswith(b) or b.startswith(a) or a in b or b in a))
 
 
@@ -202,7 +202,7 @@ async def reshape_for_speech(text: str) -> str:
             messages=[
                 {
                     "role": "system",
-                    "content":  "Rewrite the user's text into natural spoken English for voice TTS.  Keep meaning, use contractions, avoid long sentences, avoid hedging, 1 short spoken clause.  No markup.",
+                    "content":  "Rewrite the user's text into natural spoken English for voice TTS. Keep meaning, use contractions, avoid long sentences, avoid hedging, 1 short spoken clause.  No markup.",
                 },
                 {"role": "user", "content": text},
             ],
@@ -271,7 +271,7 @@ async def websocket_handler(ws: WebSocket):
     client_connected = True
 
     # -----------------------------------------------------
-    # Reader loop:  single consumer of ws. receive() to handle both text and bytes
+    # Reader loop:  single consumer of ws.receive() to handle both text and bytes
     # -----------------------------------------------------
     async def ws_reader():
         nonlocal last_audio_time, turn_id, current_active_turn_id, client_connected
@@ -389,7 +389,7 @@ async def websocket_handler(ws: WebSocket):
                 now = time.time()
                 recent_msgs = [(m, t) for (m, t) in recent_msgs if now - t < 2]
                 if any(_is_similar(m, norm) for (m, t) in recent_msgs):
-                    log.info(f"⏭ Skipping near-duplicate transcript:  '{msg}'")
+                    log.info(f"⏭ Skipping near-duplicate transcript: '{msg}'")
                     continue
                 recent_msgs. append((norm, now))
 
@@ -409,7 +409,7 @@ async def websocket_handler(ws: WebSocket):
                         if txt:
                             parts.append(txt. strip())
                     if parts:
-                        mem_facts = "Memory:  " + " ".join(parts)
+                        mem_facts = "Memory: " + " ". join(parts)
 
                 lower = msg.lower()
 
@@ -469,7 +469,7 @@ async def websocket_handler(ws: WebSocket):
                         if current_turn != current_active_turn_id:
                             log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
                             break
-                        if len(buffer) >= 22 or buffer.endswith('. ') or buffer.endswith('? ') or buffer.endswith('!') or buffer.endswith(','):
+                        if len(buffer) >= 22 or buffer.endswith('. ') or buffer.endswith('?') or buffer.endswith('! ') or buffer.endswith(','):
                             chunk_text = buffer
                             buffer = ""
                             t_task = asyncio.create_task(_tts_and_send(chunk_text, current_turn))
@@ -478,7 +478,7 @@ async def websocket_handler(ws: WebSocket):
 
                     if buffer.strip() and current_turn == current_active_turn_id:
                         t_task = asyncio.create_task(_tts_and_send(buffer, current_turn))
-                        tts_tasks_by_turn.setdefault(current_turn, set()).add(t_task)
+                        tts_tasks_by_turn. setdefault(current_turn, set()).add(t_task)
                         t_task.add_done_callback(lambda fut, t=current_turn: tts_tasks_by_turn.get(t, set()).discard(fut))
 
                     if assistant_full_text. strip() and current_turn == current_active_turn_id:
@@ -510,7 +510,7 @@ async def websocket_handler(ws: WebSocket):
     MAX_BACKOFF = 10.0
     current_backoff = INITIAL_BACKOFF
 
-    async def clear_queue(q: Queue):
+    async def clear_queue(q:  Queue):
         """Drain all items from a queue without blocking."""
         while not q.empty():
             try:
@@ -542,7 +542,7 @@ async def websocket_handler(ws: WebSocket):
                     # Reset backoff on successful connection
                     current_backoff = INITIAL_BACKOFF
                 except Exception as e:
-                    log. error(f"❌ Failed to connect to Deepgram WS: {e}")
+                    log.error(f"❌ Failed to connect to Deepgram WS: {e}")
                     if not client_connected:
                         break
                     log.info(f"⏳ Retrying Deepgram connection in {current_backoff:. 1f}s...")
@@ -765,7 +765,7 @@ async def websocket_handler(ws: WebSocket):
 # =====================================================
 # helper for n8n calls (aligned with old main behavior)
 # =====================================================
-async def send_to_n8n(url:  str, text: str) -> str:
+async def send_to_n8n(url: str, text:  str) -> str:
     try:
         async with httpx.AsyncClient(timeout=20) as c:
             payload = {"message": text}
@@ -777,7 +777,7 @@ async def send_to_n8n(url:  str, text: str) -> str:
                     data = r.json()
                     if isinstance(data, dict):
                         return (
-                            data.get("reply")
+                            data. get("reply")
                             or data.get("message")
                             or data.get("text")
                             or data.get("output")
