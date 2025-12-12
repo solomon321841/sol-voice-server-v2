@@ -60,7 +60,7 @@ N8N_PLATE_URL = "https://n8n.marshall321.org/webhook/agent/plate"
 # MODEL
 # =====================================================
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-GPT_MODEL = "gpt-4.1-mini"
+GPT_MODEL = "gpt-5-mini"
 _recent_rates = deque(maxlen=5)
 
 # =====================================================
@@ -423,6 +423,8 @@ async def websocket_handler(ws: WebSocket):
                 recent_msgs.append((norm, now))
 
                 chat_history.append({"role": "user", "content": msg})
+                if len(chat_history) > 8:
+                    chat_history[:] = chat_history[-8:]
 
                 turn_id += 1
                 current_turn = turn_id
@@ -507,6 +509,8 @@ async def websocket_handler(ws: WebSocket):
 
                     if assistant_full_text.strip() and current_turn == current_active_turn_id:
                         chat_history.append({"role": "assistant", "content": assistant_full_text.strip()})
+                        if len(chat_history) > 8:
+                            chat_history[:] = chat_history[-8:]
                         log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)})")
 
                     asyncio.create_task(mem0_add(user_id, msg))
