@@ -464,16 +464,21 @@ async def websocket_handler(ws: WebSocket):
                 chat_history[:] = chat_history[-8:]
             log.info(f"🎯 NEW TURN {current_turn}:  '{text}' (history len={len(chat_history)}) via {reason}")
 
-            mems = await mem0_search(user_id, text)
             mem_facts = ""
-            if mems:
-                parts = []
-                for m in mems[:3]:
-                    txt = m.get("memory") or m.get("content") or m.get("text")
-                    if txt:
-                        parts.append(txt.strip())
-                if parts:
-                    mem_facts = "Memory: " + " ".join(parts)
+            mem_task = asyncio.create_task(mem0_search(user_id, text))
+            try:
+                mems = await asyncio.wait_for(mem_task, timeout=0.3)
+                if mems:
+                    parts = []
+                    for m in mems[:3]:
+                        txt = m.get("memory") or m.get("content") or m.get("text")
+                        if txt:
+                            parts.append(txt.strip())
+                    if parts:
+                        mem_facts = "Memory: " + " ".join(parts)
+            except Exception:
+                if not mem_task.done():
+                    mem_task.cancel()
 
             lower = text.lower()
 
