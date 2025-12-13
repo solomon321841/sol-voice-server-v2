@@ -258,6 +258,7 @@ async def websocket_handler(ws: WebSocket):
     calendar_kw = ["calendar", "meeting", "schedule", "appointment"]
     plate_kw = ["plate", "add", "to-do", "task", "notion", "list"]
     assistant_active_stream = False
+    assistant_has_started_once = False
 
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I'm Silas."
@@ -437,7 +438,7 @@ async def websocket_handler(ws: WebSocket):
     # Transcript processor: delayed finalization with end-of-speech gate
     # -----------------------------------------------------
     async def transcript_processor():
-        nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id, current_active_turn_id, chat_history, assistant_active_stream
+        nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id, current_active_turn_id, chat_history, assistant_active_stream, assistant_has_started_once
         pending_transcript = ""
         last_update_ts = 0.0
         buffered_user_text = ""
@@ -460,7 +461,7 @@ async def websocket_handler(ws: WebSocket):
             finalize_task = asyncio.create_task(wait_and_finalize())
 
         async def commit_turn(reason: str):
-            nonlocal buffered_user_text, finalize_task, turn_id, current_active_turn_id, chat_history, assistant_active_stream
+            nonlocal buffered_user_text, finalize_task, turn_id, current_active_turn_id, chat_history, assistant_active_stream, assistant_has_started_once
             if finalize_task and not finalize_task.done():
                 finalize_task.cancel()
                 finalize_task = None
@@ -527,6 +528,7 @@ async def websocket_handler(ws: WebSocket):
 
                 log.info(f"🤖 GPT START turn={current_turn}, active={current_active_turn_id}, messages_len={len(messages)}")
                 assistant_active_stream = True
+                assistant_has_started_once = True
                 stream = await openai_client.chat.completions.create(
                     model=GPT_MODEL,
                     messages=messages,
@@ -537,7 +539,7 @@ async def websocket_handler(ws: WebSocket):
                 buffer = ""
 
                 async for chunk in stream:
-                    if current_turn != current_active_turn_id:
+                    if assistant_has_started_once and current_turn != current_active_turn_id:
                         log.info(f"🔁 CANCEL STREAM turn={current_turn}, active={current_active_turn_id}")
                         break
                     delta = getattr(chunk.choices[0].delta, "content", "")
@@ -545,7 +547,7 @@ async def websocket_handler(ws: WebSocket):
                         continue
                     assistant_full_text += delta
                     buffer += delta
-                    if current_turn != current_active_turn_id:
+                    if assistant_has_started_once and current_turn != current_active_turn_id:
                         log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
                         break
                     if (
