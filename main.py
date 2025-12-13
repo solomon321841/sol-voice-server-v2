@@ -449,8 +449,7 @@ async def websocket_handler(ws: WebSocket):
         async def wait_and_finalize():
             try:
                 await asyncio.sleep(FINAL_PAUSE_SEC)
-                if time.time() - last_final_ts >= FINAL_PAUSE_SEC:
-                    await commit_turn("timeout")
+                await commit_turn("timeout")
             except asyncio.CancelledError:
                 return
 
