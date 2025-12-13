@@ -60,8 +60,15 @@ N8N_PLATE_URL = "https://n8n.marshall321.org/webhook/agent/plate"
 # MODEL
 # =====================================================
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-GPT_MODEL = "gpt-5-mini"
+GPT_MODEL = "gpt-4o-mini"
 _recent_rates = deque(maxlen=5)
+
+# =====================================================
+# NOTION PROMPT CACHE
+# =====================================================
+NOTION_CACHE_TTL_SEC = 600
+_NOTION_PROMPT_CACHE = None
+_NOTION_PROMPT_TS = 0.0
 
 # =====================================================
 # FASTAPI
@@ -131,8 +138,17 @@ def memory_context(memories: list) -> str:
 # NOTION PROMPT (from old main)
 # =====================================================
 async def get_notion_prompt():
+    global _NOTION_PROMPT_CACHE, _NOTION_PROMPT_TS
+    default_prompt = "You are Solomon Roth's personal AI assistant, Silas."
+    now = time.time()
+    if _NOTION_PROMPT_CACHE and (now - _NOTION_PROMPT_TS) < NOTION_CACHE_TTL_SEC:
+        return _NOTION_PROMPT_CACHE
+
     if not NOTION_PAGE_ID or not NOTION_API_KEY:
-        return "You are Solomon Roth's personal AI assistant, Silas."
+        _NOTION_PROMPT_CACHE = default_prompt
+        _NOTION_PROMPT_TS = now
+        return _NOTION_PROMPT_CACHE
+
     url = f"https://api.notion.com/v1/blocks/{NOTION_PAGE_ID}/children"
     headers = {
         "Authorization": f"Bearer {NOTION_API_KEY}",
@@ -149,10 +165,15 @@ async def get_notion_prompt():
                 if blk.get("type") == "paragraph":
                     txt = "".join([r.get("plain_text", "") for r in blk["paragraph"]["rich_text"]])
                     parts.append(txt)
-            return "\n".join(parts).strip() or "You are Solomon Roth's AI assistant, Silas."
+            prompt_txt = "\n".join(parts).strip() or default_prompt
+            _NOTION_PROMPT_CACHE = prompt_txt
+            _NOTION_PROMPT_TS = time.time()
+            return _NOTION_PROMPT_CACHE
     except Exception as e:
         log.error(f"❌ Notion error: {e}")
-        return "You are Solomon Roth's AI assistant, Silas."
+        if _NOTION_PROMPT_CACHE:
+            return _NOTION_PROMPT_CACHE
+        return default_prompt
 
 
 @app.get("/prompt", response_class=PlainTextResponse)
