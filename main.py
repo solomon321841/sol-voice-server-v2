@@ -257,6 +257,7 @@ async def websocket_handler(ws: WebSocket):
     current_active_turn_id = 0
     calendar_kw = ["calendar", "meeting", "schedule", "appointment"]
     plate_kw = ["plate", "add", "to-do", "task", "notion", "list"]
+    assistant_active_stream = False
 
     prompt = await get_notion_prompt()
     greet = prompt.splitlines()[0] if prompt else "Hello Solomon, I'm Silas."
@@ -294,6 +295,15 @@ async def websocket_handler(ws: WebSocket):
     # Flag to track client connection status
     client_connected = True
 
+    def has_active_assistant():
+        if assistant_active_stream:
+            return True
+        for tasks in tts_tasks_by_turn.values():
+            for t in list(tasks):
+                if not t.done():
+                    return True
+        return False
+
     # -----------------------------------------------------
     # Reader loop: single consumer of ws.receive() to handle both text and bytes
     # -----------------------------------------------------
@@ -316,6 +326,9 @@ async def websocket_handler(ws: WebSocket):
                             now_ts = time.time()
                             if now_ts - last_interrupt_ts < INTERRUPT_DEBOUNCE_SEC:
                                 log.info("⏳ Ignoring rapid interrupt (debounced)")
+                                continue
+                            if not has_active_assistant():
+                                log.info("⏸️ Interrupt ignored (no active assistant stream/TTS)")
                                 continue
                             last_interrupt_ts = now_ts
                             turn_id += 1
@@ -424,7 +437,7 @@ async def websocket_handler(ws: WebSocket):
     # Transcript processor: delayed finalization with end-of-speech gate
     # -----------------------------------------------------
     async def transcript_processor():
-        nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id, current_active_turn_id, chat_history
+        nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id, current_active_turn_id, chat_history, assistant_active_stream
         pending_transcript = ""
         last_update_ts = 0.0
         buffered_user_text = ""
@@ -447,7 +460,7 @@ async def websocket_handler(ws: WebSocket):
             finalize_task = asyncio.create_task(wait_and_finalize())
 
         async def commit_turn(reason: str):
-            nonlocal buffered_user_text, finalize_task, turn_id, current_active_turn_id, chat_history
+            nonlocal buffered_user_text, finalize_task, turn_id, current_active_turn_id, chat_history, assistant_active_stream
             if finalize_task and not finalize_task.done():
                 finalize_task.cancel()
                 finalize_task = None
@@ -513,6 +526,7 @@ async def websocket_handler(ws: WebSocket):
                 messages += history_tail
 
                 log.info(f"🤖 GPT START turn={current_turn}, active={current_active_turn_id}, messages_len={len(messages)}")
+                assistant_active_stream = True
                 stream = await openai_client.chat.completions.create(
                     model=GPT_MODEL,
                     messages=messages,
@@ -554,6 +568,8 @@ async def websocket_handler(ws: WebSocket):
                 asyncio.create_task(mem0_add(user_id, text))
             except Exception as e:
                 log.error(f"LLM error: {e}")
+            finally:
+                assistant_active_stream = False
 
         try:
             while True:
