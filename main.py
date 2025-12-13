@@ -267,6 +267,8 @@ async def websocket_handler(ws: WebSocket):
     tts_locks_by_turn: Dict[int, asyncio.Lock] = {}
     MAX_TTS_TASKS_PER_TURN = 3
     last_audio_time = time.time()
+    last_interrupt_ts = 0.0
+    INTERRUPT_DEBOUNCE_SEC = 0.2
 
     # Flag to track client connection status
     client_connected = True
@@ -275,7 +277,7 @@ async def websocket_handler(ws: WebSocket):
     # Reader loop: single consumer of ws.receive() to handle both text and bytes
     # -----------------------------------------------------
     async def ws_reader():
-        nonlocal last_audio_time, turn_id, current_active_turn_id, client_connected
+        nonlocal last_audio_time, turn_id, current_active_turn_id, client_connected, last_interrupt_ts
         try:
             while True:
                 msg = await ws.receive()
@@ -290,6 +292,11 @@ async def websocket_handler(ws: WebSocket):
                             continue
                         typ = data.get("type")
                         if typ == "interrupt":
+                            now_ts = time.time()
+                            if now_ts - last_interrupt_ts < INTERRUPT_DEBOUNCE_SEC:
+                                log.info("⏳ Ignoring rapid interrupt (debounced)")
+                                continue
+                            last_interrupt_ts = now_ts
                             turn_id += 1
                             current_active_turn_id = turn_id
                             log.info(f"⏹️ Received interrupt from client — new active turn {current_active_turn_id}")
@@ -302,6 +309,8 @@ async def websocket_handler(ws: WebSocket):
                                             pass
                                     tts_tasks_by_turn.pop(t_id, None)
                                     tts_locks_by_turn.pop(t_id, None)
+                        elif typ == "final_silence":
+                            await dg_transcript_queue.put({"final_silence": True})
                         else:
                             log.debug(f"WS text message (ignored): {data}")
                     elif "bytes" in msg and msg["bytes"] is not None:
@@ -391,18 +400,144 @@ async def websocket_handler(ws: WebSocket):
         return task
 
     # -----------------------------------------------------
-    # Transcript processor: immediate processing; no buffering/waits.
+    # Transcript processor: delayed finalization with end-of-speech gate
     # -----------------------------------------------------
     async def transcript_processor():
         nonlocal recent_msgs, processed_messages, prompt, last_audio_time, turn_id, current_active_turn_id, chat_history
         pending_transcript = ""
         last_update_ts = 0.0
+        buffered_user_text = ""
+        last_final_ts = 0.0
+        finalize_task: asyncio.Task = None
+        FINAL_PAUSE_SEC = 0.3
+
+        async def wait_and_finalize():
+            try:
+                await asyncio.sleep(FINAL_PAUSE_SEC)
+                if time.time() - last_final_ts >= FINAL_PAUSE_SEC:
+                    await commit_turn("timeout")
+            except asyncio.CancelledError:
+                return
+
+        def schedule_finalize():
+            nonlocal finalize_task
+            if finalize_task and not finalize_task.done():
+                finalize_task.cancel()
+            finalize_task = asyncio.create_task(wait_and_finalize())
+
+        async def commit_turn(reason: str):
+            nonlocal buffered_user_text, finalize_task, turn_id, current_active_turn_id, chat_history
+            if finalize_task and not finalize_task.done():
+                finalize_task.cancel()
+                finalize_task = None
+            text = buffered_user_text.strip()
+            if not text:
+                return
+            buffered_user_text = ""
+
+            turn_id += 1
+            current_turn = turn_id
+            current_active_turn_id = current_turn
+            chat_history.append({"role": "user", "content": text})
+            if len(chat_history) > 8:
+                chat_history[:] = chat_history[-8:]
+            log.info(f"🎯 NEW TURN {current_turn}:  '{text}' (history len={len(chat_history)}) via {reason}")
+
+            mems = await mem0_search(user_id, text)
+            mem_facts = ""
+            if mems:
+                parts = []
+                for m in mems[:3]:
+                    txt = m.get("memory") or m.get("content") or m.get("text")
+                    if txt:
+                        parts.append(txt.strip())
+                if parts:
+                    mem_facts = "Memory: " + " ".join(parts)
+
+            lower = text.lower()
+
+            # Plate logic
+            if any(k in lower for k in plate_kw):
+                if text in processed_messages:
+                    log.info(f"⏭ Plate msg already processed: '{text}'")
+                    return
+                processed_messages.add(text)
+                reply = await send_to_n8n(N8N_PLATE_URL, text)
+                if current_turn != current_active_turn_id:
+                    log.info(f"🔁 Plate turn {current_turn} abandoned (active={current_active_turn_id})")
+                    return
+                schedule_tts(reply, current_turn)
+                return
+
+            # Calendar logic
+            if any(k in lower for k in calendar_kw):
+                reply = await send_to_n8n(N8N_CALENDAR_URL, text)
+                if current_turn != current_active_turn_id:
+                    log.info(f"🔁 Calendar turn {current_turn} abandoned (active={current_active_turn_id})")
+                    return
+                schedule_tts(reply, current_turn)
+                return
+
+            # General GPT streaming
+            try:
+                history_tail = chat_history[-3:]
+                messages = [{"role": "system", "content": system_msg_static}]
+                if mem_facts:
+                    messages.append({"role": "system", "content": mem_facts})
+                messages += history_tail
+
+                log.info(f"🤖 GPT START turn={current_turn}, active={current_active_turn_id}, messages_len={len(messages)}")
+                stream = await openai_client.chat.completions.create(
+                    model=GPT_MODEL,
+                    messages=messages,
+                    stream=True,
+                )
+
+                assistant_full_text = ""
+                buffer = ""
+
+                async for chunk in stream:
+                    if current_turn != current_active_turn_id:
+                        log.info(f"🔁 CANCEL STREAM turn={current_turn}, active={current_active_turn_id}")
+                        break
+                    delta = getattr(chunk.choices[0].delta, "content", "")
+                    if not delta:
+                        continue
+                    assistant_full_text += delta
+                    buffer += delta
+                    if current_turn != current_active_turn_id:
+                        log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
+                        break
+                    if (
+                        len(buffer) >= 70
+                        or buffer.endswith((". ", "? ", "! ", ".", "?", "!"))
+                    ):
+                        chunk_text = buffer
+                        buffer = ""
+                        schedule_tts(chunk_text, current_turn)
+
+                if buffer.strip() and current_turn == current_active_turn_id:
+                    schedule_tts(buffer, current_turn)
+
+                if assistant_full_text.strip() and current_turn == current_active_turn_id:
+                    chat_history.append({"role": "assistant", "content": assistant_full_text.strip()})
+                    if len(chat_history) > 8:
+                        chat_history[:] = chat_history[-8:]
+                    log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)})")
+
+                asyncio.create_task(mem0_add(user_id, text))
+            except Exception as e:
+                log.error(f"LLM error: {e}")
 
         try:
             while True:
                 transcript = await dg_transcript_queue.get()
                 if transcript is None:
                     break
+
+                if isinstance(transcript, dict) and transcript.get("final_silence"):
+                    await commit_turn("final_silence")
+                    continue
 
                 if not transcript or len(transcript) < 1 or not any(ch.isalpha() for ch in transcript):
                     log.info("⏭ Ignoring very short / non-alpha transcript")
@@ -422,104 +557,16 @@ async def websocket_handler(ws: WebSocket):
                     continue
                 recent_msgs.append((norm, now))
 
-                chat_history.append({"role": "user", "content": msg})
-                if len(chat_history) > 8:
-                    chat_history[:] = chat_history[-8:]
-
-                turn_id += 1
-                current_turn = turn_id
-                current_active_turn_id = current_turn
-                log.info(f"🎯 NEW TURN {current_turn}:  '{msg}' (history len={len(chat_history)})")
-
-                mems = await mem0_search(user_id, msg)
-                mem_facts = ""
-                if mems:
-                    parts = []
-                    for m in mems[:3]:
-                        txt = m.get("memory") or m.get("content") or m.get("text")
-                        if txt:
-                            parts.append(txt.strip())
-                    if parts:
-                        mem_facts = "Memory: " + " ".join(parts)
-
-                lower = msg.lower()
-
-                # Plate logic
-                if any(k in lower for k in plate_kw):
-                    if msg in processed_messages:
-                        log.info(f"⏭ Plate msg already processed: '{msg}'")
-                        continue
-                    processed_messages.add(msg)
-                    reply = await send_to_n8n(N8N_PLATE_URL, msg)
-                    if current_turn != current_active_turn_id:
-                        log.info(f"🔁 Plate turn {current_turn} abandoned (active={current_active_turn_id})")
-                        continue
-                    schedule_tts(reply, current_turn)
-                    continue
-
-                # Calendar logic
-                if any(k in lower for k in calendar_kw):
-                    reply = await send_to_n8n(N8N_CALENDAR_URL, msg)
-                    if current_turn != current_active_turn_id:
-                        log.info(f"🔁 Calendar turn {current_turn} abandoned (active={current_active_turn_id})")
-                        continue
-                    schedule_tts(reply, current_turn)
-                    continue
-
-                # General GPT streaming
-                try:
-                    history_tail = chat_history[-3:]
-                    messages = [{"role": "system", "content": system_msg_static}]
-                    if mem_facts:
-                        messages.append({"role": "system", "content": mem_facts})
-                    messages += history_tail
-
-                    log.info(f"🤖 GPT START turn={current_turn}, active={current_active_turn_id}, messages_len={len(messages)}")
-                    stream = await openai_client.chat.completions.create(
-                        model=GPT_MODEL,
-                        messages=messages,
-                        stream=True,
-                    )
-
-                    assistant_full_text = ""
-                    buffer = ""
-
-                    async for chunk in stream:
-                        if current_turn != current_active_turn_id:
-                            log.info(f"🔁 CANCEL STREAM turn={current_turn}, active={current_active_turn_id}")
-                            break
-                        delta = getattr(chunk.choices[0].delta, "content", "")
-                        if not delta:
-                            continue
-                        assistant_full_text += delta
-                        buffer += delta
-                        if current_turn != current_active_turn_id:
-                            log.info(f"🔁 Turn {current_turn} cancelled before TTS chunk.")
-                            break
-                        if (
-                            len(buffer) >= 70
-                            or buffer.endswith((". ", "? ", "! ", ".", "?", "!"))
-                        ):
-                            chunk_text = buffer
-                            buffer = ""
-                            schedule_tts(chunk_text, current_turn)
-
-                    if buffer.strip() and current_turn == current_active_turn_id:
-                        schedule_tts(buffer, current_turn)
-
-                    if assistant_full_text.strip() and current_turn == current_active_turn_id:
-                        chat_history.append({"role": "assistant", "content": assistant_full_text.strip()})
-                        if len(chat_history) > 8:
-                            chat_history[:] = chat_history[-8:]
-                        log.info(f"💾 Stored assistant turn {current_turn} in history (len={len(chat_history)})")
-
-                    asyncio.create_task(mem0_add(user_id, msg))
-                except Exception as e:
-                    log.error(f"LLM error: {e}")
+                buffered_user_text = (buffered_user_text + " " + msg).strip() if buffered_user_text else msg
+                last_final_ts = time.time()
+                schedule_finalize()
         except asyncio.CancelledError:
             log.info("transcript_processor cancelled")
         except Exception as e:
             log.error(f"❌ transcript_processor fatal: {e}")
+        finally:
+            if finalize_task and not finalize_task.done():
+                finalize_task.cancel()
 
     transcript_task = asyncio.create_task(transcript_processor())
 
