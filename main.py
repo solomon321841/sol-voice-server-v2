@@ -558,6 +558,8 @@ async def websocket_handler(ws: WebSocket):
                         buffer = ""
                         schedule_tts(chunk_text, current_turn)
 
+                assistant_active_stream = False
+
                 if buffer.strip() and current_turn == current_active_turn_id:
                     schedule_tts(buffer, current_turn)
 
